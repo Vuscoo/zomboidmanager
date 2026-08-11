@@ -27,6 +27,7 @@ REQUIREMENTS
 • Optional: RCON enabled in your server.ini for player/status tools
 
 HOW TO USE
+DOWNLOAD: https://github.com/Vuscoo/zomboidmanager/releases
 1. Extract the zip
 2. Run ZomboidManager.exe
 3. Set Server folder, Zomboid data folder, start .bat, and RCON in Settings
