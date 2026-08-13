@@ -1,0 +1,35 @@
+{
+  "SelectedHours": [],
+  "ServerPath": "C:\\Path\\To\\Your\\ProjectZomboidServer",
+  "StartBat": "StartServer64.bat",
+  "RconHost": "127.0.0.1",
+  "RconPort": 27015,
+  "RconPassword": "YOUR_RCON_PASSWORD_HERE",
+  "SchedulerActive": false,
+  "Announce10MinBeforeRestart": false,
+  "Announce5MinBeforeRestart": false,
+  "ZomboidUserPath": "",
+  "ZomboidDataPath": "C:\\Path\\To\\Your\\Zomboid\\ServerData",
+  "LastIniFilePath": "",
+  "UiLanguage": "en",
+  "DiscordWebhookUrl": "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN",
+  "DiscordNotifyEnabled": false,
+  "DiscordCustomMessage": "",
+  "DiscordCustomHours": [],
+  "DiscordEvents": [],
+  "BroadcastMessages": [],
+  "BackupSchedule": {
+    "Enabled": false,
+    "Mode": "recurring",
+    "Days": [],
+    "Time": "03:00",
+    "OneTimeDateTime": ""
+  },
+  "ModUpdateAutoRestart": {
+    "Enabled": false,
+    "WarningMessage": "A mod has been updated. The server will restart in {minutes} minutes to apply the update.",
+    "WarnMinutesBefore": 5,
+    "WaitForEmpty": false,
+    "MaxWaitMinutes": 60
+  }
+}

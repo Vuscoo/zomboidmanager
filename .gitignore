@@ -1,0 +1,118 @@
+## Build results
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+artifacts/
+publish/
+out/
+dist/
+
+## Visual Studio / Rider / VS Code
+.vs/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.sln.docstates
+*.rsuser
+*.DotSettings.user
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+
+## NuGet
+*.nupkg
+*.snupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+## .NET
+*.dll
+*.exe
+*.pdb
+*.cache
+*.ilk
+*.meta
+*.obj
+*.iobj
+*.ipdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.tmp_proj
+*_wpftmp.csproj
+*.log
+*.tlog
+*.idb
+*.opendb
+*.dbmdl
+*.dbproj.schemaview
+*.jfm
+*.pfx
+*.publishsettings
+*.appx
+*.appxbundle
+*.msix
+*.msixbundle
+
+# Keep source assets; ignore accidental binary drops at repo root
+!Assets/**
+
+## WebView2 / Chromium user data next to the EXE
+**/*.exe.WebView2/
+**/EBWebView/
+
+## App / local secrets (never commit real settings)
+# Real runtime config only — config.example.json is the public template and must be committed.
+config.json
+**/config.json
+mod_update_state.json
+**/mod_update_state.json
+
+## Local test / scratch (personal machine paths, throwaway servers)
+test/
+tests/
+**/test2/
+fsdfsdf/
+
+## Publish / packaging leftovers
+*.zip
+*.7z
+*.rar
+*.msi
+*.msixupload
+*.vspackage
+*.nupkg
+TestResults/
+[Cc]overage/
+*.coverage
+*.coveragexml
+
+## OS junk
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+## Windows / misc
+*.lnk
+*.stackdump
+*.bak
+*.swp
+*~
