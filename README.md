@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Local dedicated server control for Project Zomboid</strong><br/>
-  One Windows app for start/stop, restarts, config, RCON, backups, players, Discord — without a remote shell or a public web panel.
+  One Windows app for start/stop, restarts, config, RCON, backups, players, Discord — without a remote shell or a public web panel
 </p>
 
 <p align="center">
