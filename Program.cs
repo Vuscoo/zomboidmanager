@@ -20,6 +20,36 @@ static class Program
             return;
         }
 
+        if (args.Any(a => string.Equals(a, "--selftest-log-analyzer", StringComparison.OrdinalIgnoreCase)))
+        {
+            PzLogParser.RunSelfTest();
+            return;
+        }
+
+        if (args.Any(a => string.Equals(a, "--selftest-config-profiles", StringComparison.OrdinalIgnoreCase)))
+        {
+            ConfigProfileManagerSelfTest.Run();
+            return;
+        }
+
+        if (args.Any(a => string.Equals(a, "--selftest-whitelist", StringComparison.OrdinalIgnoreCase)))
+        {
+            WhitelistStore.RunSelfTest();
+            return;
+        }
+
+        if (args.Any(a => string.Equals(a, "--selftest-stats-history", StringComparison.OrdinalIgnoreCase)))
+        {
+            StatsHistoryStore.RunSelfTest();
+            return;
+        }
+
+        if (args.Any(a => string.Equals(a, "--selftest-backup", StringComparison.OrdinalIgnoreCase)))
+        {
+            BackupManagerSelfTest.Run();
+            return;
+        }
+
         // UI text is English; keep German culture for dates, times, and numbers.
         var de = CultureInfo.GetCultureInfo("de-DE");
         CultureInfo.DefaultThreadCurrentCulture = de;

@@ -16,9 +16,9 @@
     <Authors>Vusco</Authors>
     <Description>Project Zomboid Dedicated Server Management Tool</Description>
     <Copyright>© 2026 Vusco</Copyright>
-    <Version>1.0.8</Version>
-    <FileVersion>1.0.8.0</FileVersion>
-    <InformationalVersion>1.0.8</InformationalVersion>
+    <Version>1.0.9</Version>
+    <FileVersion>1.0.9.0</FileVersion>
+    <InformationalVersion>1.0.9</InformationalVersion>
   </PropertyGroup>
 
   <!--
@@ -44,6 +44,7 @@
 
   <ItemGroup>
     <PackageReference Include="CoreRCON" Version="5.4.2" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.11" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4129.50" />
     <PackageReference Include="System.Text.Json" Version="10.0.10" />
   </ItemGroup>
