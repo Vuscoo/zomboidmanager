@@ -3,35 +3,19 @@ namespace ZomboidManager;
 /// <summary>
 /// Polls enabled broadcast slots and raises events when a message is due.
 /// Does not send RCON itself — MainForm handles delivery and success/failure.
+/// Ticked by <see cref="SchedulerHeartbeat"/>.
 /// </summary>
-public sealed class BroadcastManager : IDisposable
+public sealed class BroadcastManager
 {
     public const int MaxSlots = 5;
 
-    private readonly System.Windows.Forms.Timer _timer;
     private List<BroadcastMessageSlot> _slots = Normalize(null);
     private bool _tickInProgress;
 
     /// <summary>slotIndex, slot — raised when a send should be attempted.</summary>
     public event Action<int, BroadcastMessageSlot>? BroadcastDue;
 
-    public BroadcastManager()
-    {
-        _timer = new System.Windows.Forms.Timer { Interval = 15000 };
-        _timer.Tick += OnTimerTick;
-    }
-
     public IReadOnlyList<BroadcastMessageSlot> Slots => _slots;
-
-    public void Start() => _timer.Start();
-
-    public void Stop() => _timer.Stop();
-
-    public void Dispose()
-    {
-        _timer.Stop();
-        _timer.Dispose();
-    }
 
     public void UpdateSlots(IEnumerable<BroadcastMessageSlot>? slots)
     {
@@ -132,7 +116,8 @@ public sealed class BroadcastManager : IDisposable
         };
     }
 
-    private void OnTimerTick(object? sender, EventArgs e)
+    /// <summary>Invoked by <see cref="SchedulerHeartbeat"/>.</summary>
+    public void Tick()
     {
         if (_tickInProgress)
             return;

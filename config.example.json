@@ -31,5 +31,7 @@
     "WarnMinutesBefore": 5,
     "WaitForEmpty": false,
     "MaxWaitMinutes": 60
-  }
+  },
+  "StatsIntervalMinutes": 2,
+  "StatsRetentionDays": 30
 }

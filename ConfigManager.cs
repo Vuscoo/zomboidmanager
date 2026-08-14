@@ -35,6 +35,12 @@ public class AppConfig
     public BackupScheduleConfig BackupSchedule { get; set; } = new();
 
     public ModUpdateAutoRestartConfig ModUpdateAutoRestart { get; set; } = new();
+
+    /// <summary>Minutes between historical stats samples while the server is running (1–5).</summary>
+    public int StatsIntervalMinutes { get; set; } = 2;
+
+    /// <summary>Days of stats/restart history to keep (default 30).</summary>
+    public int StatsRetentionDays { get; set; } = 30;
 }
 
 public class ModUpdateAutoRestartConfig
@@ -94,6 +100,13 @@ public static class ConfigManager
         WriteIndented = true
     };
 
+    /// <summary>Coalesce rapid Save() calls into one disk write.</summary>
+    public const int DebounceMilliseconds = 500;
+
+    private static readonly object Sync = new();
+    private static AppConfig? _pendingConfig;
+    private static System.Threading.Timer? _debounceTimer;
+
     public static AppConfig Load()
     {
         try
@@ -112,11 +125,75 @@ public static class ConfigManager
         }
     }
 
+    /// <summary>
+    /// Marks config dirty and schedules a disk write after <see cref="DebounceMilliseconds"/>.
+    /// Further calls within the window reset the delay (one coalesced write).
+    /// </summary>
     public static void Save(AppConfig config)
     {
-        Directory.CreateDirectory(ConfigDirectory);
-        string json = JsonSerializer.Serialize(config, JsonOptions);
-        File.WriteAllText(ConfigPath, json);
+        ArgumentNullException.ThrowIfNull(config);
+
+        lock (Sync)
+        {
+            _pendingConfig = config;
+            _debounceTimer ??= new System.Threading.Timer(static _ =>
+            {
+                try
+                {
+                    FlushPending();
+                }
+                catch
+                {
+                    // never throw from timer thread
+                }
+            });
+            _debounceTimer.Change(DebounceMilliseconds, Timeout.Infinite);
+        }
+    }
+
+    /// <summary>
+    /// Cancels any pending debounced write and writes <paramref name="config"/> to disk now.
+    /// Use for explicit user "save settings" actions and similar confirmation paths.
+    /// </summary>
+    public static void SaveImmediately(AppConfig config)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+
+        lock (Sync)
+        {
+            _pendingConfig = null;
+            _debounceTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        }
+
+        WriteToDisk(config);
+    }
+
+    /// <summary>
+    /// Writes any pending debounced config immediately (no-op if nothing is dirty).
+    /// Call on clean app shutdown so coalesced changes are not lost.
+    /// </summary>
+    public static void FlushPending()
+    {
+        AppConfig? config;
+        lock (Sync)
+        {
+            config = _pendingConfig;
+            _pendingConfig = null;
+            _debounceTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+        }
+
+        if (config is not null)
+            WriteToDisk(config);
+    }
+
+    private static void WriteToDisk(AppConfig config)
+    {
+        lock (Sync)
+        {
+            Directory.CreateDirectory(ConfigDirectory);
+            string json = JsonSerializer.Serialize(config, JsonOptions);
+            File.WriteAllText(ConfigPath, json);
+        }
     }
 
     private static void MigrateLegacyConfigIfNeeded()

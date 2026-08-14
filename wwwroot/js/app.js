@@ -1,5 +1,8 @@
 (() => {
   let statusIntervalId = null;
+  let statsPollId = null;
+  let statsRange = "24h";
+  let currentTabName = "server";
   let currentIniPath = "";
   let currentIniEntries = [];
   let currentSandboxPath = "";
@@ -17,15 +20,34 @@
     }
   }
 
-  function requestServerStatus() {
-    sendToCSharp("get_server_status");
+  /** Full server status. Pass { includePlayers: false } for a cheap online check (no RCON). */
+  function requestServerStatus(options = {}) {
+    const includePlayers = options.includePlayers !== undefined
+      ? Boolean(options.includePlayers)
+      : true;
+    sendToCSharp("get_server_status", { includePlayers });
   }
 
   function requestSettings() {
     sendToCSharp("get_settings");
   }
 
+  function startStatusPolling() {
+    stopStatusPolling();
+    statusIntervalId = setInterval(() => {
+      requestServerStatus();
+    }, 15000);
+  }
+
+  function stopStatusPolling() {
+    if (statusIntervalId !== null) {
+      clearInterval(statusIntervalId);
+      statusIntervalId = null;
+    }
+  }
+
   function activateTab(tabName) {
+    currentTabName = tabName;
     const items = document.querySelectorAll(".sidebar li");
     const panels = document.querySelectorAll(".tab-content");
     const pageTitle = document.getElementById("page-title");
@@ -48,14 +70,32 @@
     }
 
     if (tabName === "server") {
+      // Immediate refresh — do not wait for the next 15s tick.
       requestServerStatus();
+      startStatusPolling();
       sendToCSharp("start_hardware_monitor");
     } else {
+      stopStatusPolling();
       sendToCSharp("stop_hardware_monitor");
+    }
+
+    if (tabName !== "tools") {
+      releaseLogAnalyzerSession();
+    }
+
+    if (tabName === "stats") {
+      requestStatsHistory();
+      startStatsPolling();
+    } else {
+      stopStatsPolling();
     }
 
     if (tabName === "rcon" || tabName === "settings") {
       requestSettings();
+    }
+
+    if (tabName === "config") {
+      sendToCSharp("list_config_profiles");
     }
   }
 
@@ -76,16 +116,6 @@
     });
 
     activateTab("server");
-  }
-
-  function setupStatusPolling() {
-    if (statusIntervalId !== null) {
-      clearInterval(statusIntervalId);
-    }
-
-    statusIntervalId = setInterval(() => {
-      requestServerStatus();
-    }, 15000);
   }
 
   function setupRestartControls() {
@@ -243,8 +273,9 @@
     });
   }
 
-  function appendConsoleLine(text, className) {
-    const output = document.getElementById("rcon-console-output");
+  const CONSOLE_MAX_LINES = 500;
+
+  function appendCappedConsoleLine(output, text, className) {
     if (!output) {
       return;
     }
@@ -253,7 +284,16 @@
     line.className = `console-line${className ? ` ${className}` : ""}`;
     line.textContent = `[${formatConsoleStamp()}] ${text}`;
     output.appendChild(line);
+
+    while (output.childElementCount > CONSOLE_MAX_LINES) {
+      output.removeChild(output.firstElementChild);
+    }
+
     output.scrollTop = output.scrollHeight;
+  }
+
+  function appendConsoleLine(text, className) {
+    appendCappedConsoleLine(document.getElementById("rcon-console-output"), text, className);
   }
 
   window.sendRconCommand = function sendRconCommand(cmd) {
@@ -740,6 +780,109 @@
     document.getElementById("players-modal-close")?.addEventListener("click", () => {
       document.getElementById("players-modal")?.classList.add("hidden");
     });
+
+    setupConfigProfilesControls();
+  }
+
+  function fillProfileTemplate(key, vars) {
+    return Object.keys(vars).reduce(
+      (s, k) => s.replaceAll(`{${k}}`, String(vars[k])),
+      tr(key)
+    );
+  }
+
+  function renderConfigProfiles(payload) {
+    const list = document.getElementById("config-profiles-list");
+    if (!list) return;
+    const profiles = payload?.profiles || [];
+    if (!profiles.length) {
+      list.innerHTML = `<p class="muted">${tr("profiles.empty")}</p>`;
+      return;
+    }
+
+    list.innerHTML = profiles.map((p) => {
+      const applied = p.lastApplied
+        ? `${tr("profiles.lastApplied")}: ${escapeHtml(p.lastApplied)}`
+        : tr("profiles.neverApplied");
+      return `<div class="config-profile-row" data-id="${escapeHtml(p.id)}">
+        <div class="config-profile-meta">
+          <strong>${escapeHtml(p.name || p.id)}</strong>
+          <div class="muted">${tr("profiles.created")}: ${escapeHtml(p.created || "–")} · ${applied}</div>
+          <div class="muted">${escapeHtml(p.iniFileName || "")} · ${escapeHtml(p.sandboxFileName || "")}</div>
+        </div>
+        <div class="config-profile-actions">
+          <button type="button" class="btn btn-sm" data-profile-action="load">${tr("profiles.load")}</button>
+          <button type="button" class="btn secondary btn-sm" data-profile-action="rename">${tr("profiles.rename")}</button>
+          <button type="button" class="btn secondary btn-sm" data-profile-action="delete">${tr("profiles.delete")}</button>
+        </div>
+      </div>`;
+    }).join("");
+  }
+
+  function setupConfigProfilesControls() {
+    document.getElementById("profile-save-btn")?.addEventListener("click", () => {
+      const name = prompt(tr("profiles.namePrompt"), "");
+      if (name === null) return;
+      const trimmed = String(name).trim();
+      if (!trimmed) {
+        showToast(tr("profiles.nameRequired"), false);
+        return;
+      }
+      sendToCSharp("save_config_profile", { name: trimmed });
+    });
+
+    document.getElementById("profile-refresh-btn")?.addEventListener("click", () => {
+      sendToCSharp("list_config_profiles");
+    });
+
+    document.getElementById("config-profiles-list")?.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("[data-profile-action]");
+      const row = ev.target.closest(".config-profile-row");
+      if (!btn || !row) return;
+      const id = row.getAttribute("data-id");
+      const name = row.querySelector("strong")?.textContent || id;
+      const action = btn.getAttribute("data-profile-action");
+      if (!id) return;
+
+      if (action === "load") {
+        if (!confirm(fillProfileTemplate("profiles.confirmLoad", { name }))) return;
+        sendToCSharp("load_config_profile", { id });
+        return;
+      }
+
+      if (action === "rename") {
+        const next = prompt(tr("profiles.renamePrompt"), name);
+        if (next === null) return;
+        const trimmed = String(next).trim();
+        if (!trimmed) {
+          showToast(tr("profiles.nameRequired"), false);
+          return;
+        }
+        sendToCSharp("rename_config_profile", { id, name: trimmed });
+        return;
+      }
+
+      if (action === "delete") {
+        if (!confirm(fillProfileTemplate("profiles.confirmDelete", { name }))) return;
+        sendToCSharp("delete_config_profile", { id });
+      }
+    });
+  }
+
+  function handleConfigProfileLoaded(payload) {
+    const success = Boolean(payload?.success);
+    if (!success) {
+      showToast(payload?.message || tr("profiles.empty"), false);
+      return;
+    }
+
+    showToast(payload?.message || tr("profiles.saved"), true);
+    const name = payload?.profileName || payload?.profile?.name || "";
+    if (confirm(fillProfileTemplate("profiles.confirmRestart", { name }))) {
+      sendToCSharp("manual_restart");
+    } else {
+      showToast(tr("profiles.restartLater"), true, 4500);
+    }
   }
 
   function applySelectedHours(hours) {
@@ -768,15 +911,7 @@
   }
 
   function appendServerConsoleLine(text) {
-    const output = document.getElementById("server-console-output");
-    if (!output) {
-      return;
-    }
-    const line = document.createElement("div");
-    line.className = "console-line";
-    line.textContent = `[${formatConsoleStamp()}] ${text}`;
-    output.appendChild(line);
-    output.scrollTop = output.scrollHeight;
+    appendCappedConsoleLine(document.getElementById("server-console-output"), text);
   }
 
   function applyHardwareStats(payload) {
@@ -821,7 +956,282 @@
     }
   }
 
+  function requestStatsHistory() {
+    sendToCSharp("get_stats_history", { range: statsRange });
+  }
+
+  function startStatsPolling() {
+    stopStatsPolling();
+    statsPollId = setInterval(requestStatsHistory, 60000);
+  }
+
+  function stopStatsPolling() {
+    if (statsPollId !== null) {
+      clearInterval(statsPollId);
+      statsPollId = null;
+    }
+  }
+
+  function setupStatsControls() {
+    document.querySelectorAll("#stats-range [data-range]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        statsRange = btn.dataset.range || "24h";
+        document.querySelectorAll("#stats-range [data-range]").forEach((other) => {
+          other.classList.toggle("active", other === btn);
+        });
+        requestStatsHistory();
+      });
+    });
+
+    document.getElementById("stats-refresh")?.addEventListener("click", requestStatsHistory);
+
+    document.getElementById("stats-save-settings")?.addEventListener("click", () => {
+      sendToCSharp("save_stats_settings", {
+        range: statsRange,
+        intervalMinutes: Number(document.getElementById("stats-interval")?.value) || 2,
+        retentionDays: Number(document.getElementById("stats-retention")?.value) || 30
+      });
+    });
+
+    window.addEventListener("resize", () => {
+      const tab = document.getElementById("tab-stats");
+      if (tab && !tab.classList.contains("hidden") && window.__lastStatsPayload) {
+        applyStatsHistory(window.__lastStatsPayload);
+      }
+    });
+  }
+
+  function statsReasonLabel(reason) {
+    switch (reason) {
+      case "scheduled": return tr("stats.reasonScheduled");
+      case "manual": return tr("stats.reasonManual");
+      case "mod-update": return tr("stats.reasonModUpdate");
+      case "crash-recovery": return tr("stats.reasonCrash");
+      default: return reason || "–";
+    }
+  }
+
+  function fillTemplate(key, values) {
+    let text = tr(key);
+    Object.keys(values || {}).forEach((name) => {
+      text = text.replaceAll(`{${name}}`, String(values[name]));
+    });
+    return text;
+  }
+
+  function applyStatsHistory(payload) {
+    window.__lastStatsPayload = payload;
+    const samples = Array.isArray(payload.samples) ? payload.samples : [];
+    const restarts = Array.isArray(payload.restarts) ? payload.restarts : [];
+    const uptime = payload.uptime || {};
+
+    const intervalEl = document.getElementById("stats-interval");
+    if (intervalEl && payload.intervalMinutes) {
+      intervalEl.value = String(payload.intervalMinutes);
+    }
+    const retentionEl = document.getElementById("stats-retention");
+    if (retentionEl && payload.retentionDays) {
+      retentionEl.value = String(payload.retentionDays);
+    }
+
+    const uptimeEl = document.getElementById("stats-uptime-pct");
+    const uptimeDetail = document.getElementById("stats-uptime-detail");
+    if (uptimeEl) {
+      uptimeEl.textContent = uptime.hasData ? `${Number(uptime.percent || 0).toFixed(1)}%` : "–";
+    }
+    if (uptimeDetail) {
+      uptimeDetail.textContent = uptime.hasData
+        ? fillTemplate("stats.uptimeDetail", {
+            actual: Number(uptime.actualHours || 0).toFixed(1),
+            expected: Number(uptime.expectedHours || 0).toFixed(1)
+          })
+        : tr("stats.noData");
+    }
+
+    const unexpectedEl = document.getElementById("stats-unexpected");
+    const plannedEl = document.getElementById("stats-planned");
+    if (unexpectedEl) {
+      unexpectedEl.textContent = uptime.hasData
+        ? `${Number(uptime.unexpectedDowntimeMinutes || 0).toFixed(1)} min`
+        : "–";
+    }
+    if (plannedEl) {
+      plannedEl.textContent = uptime.hasData
+        ? fillTemplate("stats.planned", {
+            minutes: Number(uptime.plannedDowntimeMinutes || 0).toFixed(1)
+          })
+        : "";
+    }
+
+    const countEl = document.getElementById("stats-sample-count");
+    if (countEl) {
+      countEl.textContent = String(payload.sampleCount ?? samples.length);
+    }
+    const diskEl = document.getElementById("stats-disk-latest");
+    if (diskEl) {
+      const last = samples.length ? samples[samples.length - 1] : null;
+      diskEl.textContent = last && last.diskFreeGb != null
+        ? fillTemplate("stats.diskLatest", { gb: last.diskFreeGb })
+        : "";
+    }
+
+    const playerPoints = samples.map((s) => ({ t: s.t, y: s.players == null ? null : Number(s.players) }));
+    const cpuPoints = samples.map((s) => ({ t: s.t, y: Number(s.cpu) }));
+    const ramPoints = samples.map((s) => ({ t: s.t, y: Number(s.ram) }));
+
+    drawLineChart("stats-players-chart", "stats-players-empty", [
+      { label: tr("stats.players"), color: "#8a5cf6", points: playerPoints }
+    ], { fromTs: payload.fromTs, toTs: payload.toTs, yMin: 0 });
+
+    drawLineChart("stats-hw-chart", "stats-hw-empty", [
+      { label: tr("stats.cpu"), color: "#46c882", points: cpuPoints },
+      { label: tr("stats.ram"), color: "#f0b43c", points: ramPoints }
+    ], { fromTs: payload.fromTs, toTs: payload.toTs, yMin: 0, yMax: 100 });
+
+    const body = document.getElementById("stats-restart-body");
+    if (body) {
+      body.innerHTML = "";
+      if (!restarts.length) {
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = 2;
+        cell.className = "muted";
+        cell.textContent = tr("stats.noRestarts");
+        row.appendChild(cell);
+        body.appendChild(row);
+      } else {
+        restarts.forEach((item) => {
+          const row = document.createElement("tr");
+          const time = document.createElement("td");
+          time.textContent = item.at || formatStatsTime(item.t);
+          const reason = document.createElement("td");
+          const badge = document.createElement("span");
+          badge.className = `stats-reason ${item.reason || ""}`;
+          badge.textContent = statsReasonLabel(item.reason);
+          reason.appendChild(badge);
+          row.appendChild(time);
+          row.appendChild(reason);
+          body.appendChild(row);
+        });
+      }
+    }
+  }
+
+  function formatStatsTime(ts) {
+    if (!ts) return "–";
+    try {
+      return new Date(Number(ts)).toLocaleString();
+    } catch {
+      return String(ts);
+    }
+  }
+
+  function drawLineChart(canvasId, emptyId, series, options) {
+    const canvas = document.getElementById(canvasId);
+    const empty = document.getElementById(emptyId);
+    if (!canvas) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const allPoints = series.flatMap((s) => (s.points || []).filter((p) => p.y != null && !Number.isNaN(p.y)));
+    if (empty) {
+      empty.classList.toggle("hidden", allPoints.length > 0);
+    }
+    if (!allPoints.length) {
+      const dpr = window.devicePixelRatio || 1;
+      const width = canvas.clientWidth || 900;
+      const height = canvas.clientHeight || 240;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const width = canvas.clientWidth || 900;
+    const height = canvas.clientHeight || 240;
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+
+    const pad = { top: 16, right: 16, bottom: 28, left: 42 };
+    const plotW = Math.max(10, width - pad.left - pad.right);
+    const plotH = Math.max(10, height - pad.top - pad.bottom);
+    const fromTs = options.fromTs || allPoints[0].t;
+    const toTs = options.toTs || allPoints[allPoints.length - 1].t;
+    const span = Math.max(1, toTs - fromTs);
+    const yVals = allPoints.map((p) => p.y);
+    const yMin = options.yMin != null ? options.yMin : Math.min(...yVals);
+    let yMax = options.yMax != null ? options.yMax : Math.max(...yVals);
+    if (yMax <= yMin) yMax = yMin + 1;
+
+    const xOf = (t) => pad.left + ((t - fromTs) / span) * plotW;
+    const yOf = (y) => pad.top + (1 - (y - yMin) / (yMax - yMin)) * plotH;
+
+    ctx.strokeStyle = "rgba(50, 44, 71, 0.95)";
+    ctx.lineWidth = 1;
+    ctx.fillStyle = "#9a94ac";
+    ctx.font = "11px Segoe UI, sans-serif";
+    const ticks = 4;
+    for (let i = 0; i <= ticks; i++) {
+      const y = pad.top + (plotH * i) / ticks;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(width - pad.right, y);
+      ctx.stroke();
+      const val = yMax - ((yMax - yMin) * i) / ticks;
+      ctx.fillText(String(Math.round(val * 10) / 10), 6, y + 4);
+    }
+
+    ctx.fillText(formatChartTick(fromTs), pad.left, height - 8);
+    ctx.fillText(formatChartTick(toTs), width - pad.right - 70, height - 8);
+
+    series.forEach((set) => {
+      const pts = (set.points || []).filter((p) => p.y != null && !Number.isNaN(p.y));
+      if (!pts.length) return;
+      ctx.beginPath();
+      pts.forEach((p, i) => {
+        const x = xOf(p.t);
+        const y = yOf(p.y);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.lineTo(xOf(pts[pts.length - 1].t), pad.top + plotH);
+      ctx.lineTo(xOf(pts[0].t), pad.top + plotH);
+      ctx.closePath();
+      ctx.fillStyle = `${set.color}22`;
+      ctx.fill();
+
+      ctx.beginPath();
+      pts.forEach((p, i) => {
+        const x = xOf(p.t);
+        const y = yOf(p.y);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = set.color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    });
+  }
+
+  function formatChartTick(ts) {
+    try {
+      const d = new Date(Number(ts));
+      const sameDaySpan = statsRange === "24h";
+      return sameDaySpan
+        ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : d.toLocaleDateString([], { day: "2-digit", month: "2-digit" });
+    } catch {
+      return "";
+    }
+  }
+
   function hideToolsPanels() {
+    hideLogRowMenu();
     ["mod-list-panel", "backup-panel", "broadcast-panel", "players-panel", "discord-panel", "admin-commands-panel", "log-viewer-panel"].forEach((id) => {
       document.getElementById(id)?.classList.add("hidden");
     });
@@ -829,6 +1239,12 @@
   }
 
   function showToolsPanel(panelId) {
+    const logPanel = document.getElementById("log-viewer-panel");
+    const leavingLog = logPanel && !logPanel.classList.contains("hidden") && panelId !== "log-viewer-panel";
+    if (leavingLog) {
+      releaseLogAnalyzerSession();
+    }
+
     switchTab("tools");
     document.getElementById("tools-grid")?.classList.add("hidden");
     ["mod-list-panel", "backup-panel", "broadcast-panel", "players-panel", "discord-panel", "admin-commands-panel", "log-viewer-panel"].forEach((id) => {
@@ -864,7 +1280,7 @@
     }
   }
 
-  function setBackupProgressModal(active, done, file) {
+  function setBackupProgressModal(active, done, file, total, percent) {
     const modal = document.getElementById("backup-progress-modal");
     if (!modal) {
       return;
@@ -872,14 +1288,49 @@
     modal.classList.toggle("hidden", !active);
     const count = document.getElementById("backup-progress-count");
     const fileEl = document.getElementById("backup-progress-file");
+    const bar = document.getElementById("backup-progress-bar");
+    const cancelBtn = document.getElementById("backup-progress-cancel");
+
+    const totalN = Number(total) || 0;
+    const doneN = Number(done) || 0;
+    const pct = totalN > 0
+      ? Math.max(0, Math.min(100, Number(percent) || Math.round((doneN / totalN) * 100)))
+      : 0;
+
     if (count) {
-      count.textContent = done ? `${done} files…` : "";
+      if (totalN > 0) {
+        count.textContent = fillTemplate("backup.progressCount", {
+          done: doneN.toLocaleString(),
+          total: totalN.toLocaleString(),
+          percent: pct
+        });
+      } else {
+        count.textContent = doneN ? `${doneN.toLocaleString()}…` : "";
+      }
+    }
+    if (bar) {
+      bar.classList.toggle("indeterminate", active && totalN <= 0);
+      bar.style.width = active && totalN > 0 ? `${pct}%` : (active ? "30%" : "0%");
     }
     if (fileEl && file) {
       fileEl.textContent = file;
     } else if (fileEl && active) {
       fileEl.textContent = tr("backup.progressWait");
     }
+    if (cancelBtn) {
+      cancelBtn.disabled = !active;
+    }
+  }
+
+  function setupBackupProgressControls() {
+    document.getElementById("backup-progress-cancel")?.addEventListener("click", () => {
+      sendToCSharp("cancel_backup");
+      const cancelBtn = document.getElementById("backup-progress-cancel");
+      if (cancelBtn) {
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = tr("backup.cancelling");
+      }
+    });
   }
 
   function prependLog(message) {
@@ -934,6 +1385,7 @@
   let modViewMode = "tiles";
 
   window.openModListTool = function openModListTool() {
+    ensureLazySetup("modList", setupModListControls);
     showToolsPanel("mod-list-panel");
     sendToCSharp("get_mod_list");
   };
@@ -1245,8 +1697,10 @@
   };
 
   window.openPlayersTool = function openPlayersTool() {
+    ensureLazySetup("playersDiscord", setupPlayersAndDiscordControls);
     showToolsPanel("players-panel");
     sendToCSharp("get_player_list");
+    sendToCSharp("get_whitelist");
   };
 
   window.closePlayersTool = function closePlayersTool() {
@@ -1254,6 +1708,7 @@
   };
 
   window.openDiscordTool = function openDiscordTool() {
+    ensureLazySetup("playersDiscord", setupPlayersAndDiscordControls);
     showToolsPanel("discord-panel");
     requestSettings();
   };
@@ -1392,6 +1847,7 @@
   }
 
   window.openAdminCommandsTool = function openAdminCommandsTool() {
+    ensureLazySetup("adminCommands", setupAdminCommandsControls);
     showToolsPanel("admin-commands-panel");
     loadAdminCommands();
   };
@@ -1520,6 +1976,7 @@
       const row = document.createElement("button");
       row.type = "button";
       row.className = "log-file-item";
+      if (logAnalyzer.path && f.path === logAnalyzer.path) row.classList.add("active");
       row.innerHTML = `
         <strong>${escapeHtml(f.name || "")}</strong>
         <div class="muted">${escapeHtml(f.source || "")} · ${escapeHtml(f.sizeLabel || "")}</div>
@@ -1527,36 +1984,421 @@
       row.addEventListener("click", () => {
         list.querySelectorAll(".log-file-item").forEach((el) => el.classList.remove("active"));
         row.classList.add("active");
-        sendToCSharp("read_log", { path: f.path });
+        setLogLoading(true, 0);
+        sendToCSharp("analyze_log", { path: f.path });
       });
       list.appendChild(row);
     });
   }
 
-  function applyLogContent(payload) {
-    const view = document.getElementById("log-content-view");
+  const LOG_PAGE_SIZE = 150;
+  const logAnalyzer = {
+    path: "",
+    level: "",
+    category: "",
+    search: "",
+    sortBy: "timestamp",
+    sortDir: "asc",
+    offset: 0,
+    total: 0,
+    rows: [],
+    selectedIndex: -1,
+    searchTimer: 0,
+    menuRow: null
+  };
+
+  function setLogLoading(show, percent) {
+    const el = document.getElementById("log-loading");
+    const text = document.getElementById("log-loading-text");
+    const bar = document.getElementById("log-progress-bar");
+    if (!el) return;
+    el.classList.toggle("hidden", !show);
+    if (text) {
+      const pct = typeof percent === "number" ? ` ${percent}%` : "";
+      text.textContent = tr("logViewer.loading") + pct;
+    }
+    if (bar) {
+      bar.classList.toggle("indeterminate", !(percent > 0 && percent < 100));
+      if (percent > 0 && percent < 100) {
+        bar.style.width = `${percent}%`;
+      } else {
+        bar.style.width = "";
+      }
+    }
+  }
+
+  function queryLogEntries() {
+    sendToCSharp("query_log_entries", {
+      level: logAnalyzer.level,
+      category: logAnalyzer.category,
+      search: logAnalyzer.search,
+      sortBy: logAnalyzer.sortBy,
+      sortDir: logAnalyzer.sortDir,
+      offset: logAnalyzer.offset,
+      limit: LOG_PAGE_SIZE
+    });
+  }
+
+  function highlightSearch(text, needle) {
+    const raw = String(text ?? "");
+    if (!needle) return escapeHtml(raw);
+    const lower = raw.toLowerCase();
+    const q = needle.toLowerCase();
+    let out = "";
+    let i = 0;
+    while (i < raw.length) {
+      const hit = lower.indexOf(q, i);
+      if (hit < 0) {
+        out += escapeHtml(raw.slice(i));
+        break;
+      }
+      out += escapeHtml(raw.slice(i, hit));
+      out += `<mark class="log-search-hit">${escapeHtml(raw.slice(hit, hit + needle.length))}</mark>`;
+      i = hit + needle.length;
+    }
+    return out;
+  }
+
+  function fillTemplate(key, vars) {
+    return Object.keys(vars).reduce(
+      (s, k) => s.replaceAll(`{${k}}`, String(vars[k])),
+      tr(key)
+    );
+  }
+
+  function renderLogTable(page) {
+    const body = document.getElementById("log-table-body");
+    const pager = document.getElementById("log-pager");
+    if (!body) return;
+    const rows = page?.rows || [];
+    logAnalyzer.rows = rows;
+    logAnalyzer.total = page?.total || 0;
+    logAnalyzer.offset = page?.offset || 0;
+
+    if (!rows.length) {
+      body.innerHTML = `<tr><td colspan="4" class="muted">${tr("logViewer.noRows")}</td></tr>`;
+    } else {
+      body.innerHTML = rows.map((row) => {
+        const level = (row.level || "").toUpperCase();
+        const cls = [
+          level === "ERROR" ? "log-row-error" : "",
+          level === "WARN" ? "log-row-warn" : "",
+          row.index === logAnalyzer.selectedIndex ? "selected" : ""
+        ].filter(Boolean).join(" ");
+        return `<tr class="${cls}" data-index="${row.index}">
+          <td>${escapeHtml(row.timestamp || "")}</td>
+          <td>${escapeHtml(row.level || "")}</td>
+          <td>${escapeHtml(row.category || "")}</td>
+          <td>${highlightSearch(row.preview || row.message || "", logAnalyzer.search)}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    const from = logAnalyzer.total === 0 ? 0 : logAnalyzer.offset + 1;
+    const to = Math.min(logAnalyzer.offset + rows.length, logAnalyzer.total);
+    const canPrev = logAnalyzer.offset > 0;
+    const canNext = logAnalyzer.offset + LOG_PAGE_SIZE < logAnalyzer.total;
+    if (pager) {
+      pager.innerHTML = `
+        <span>${fillTemplate("logViewer.page", { from, to, total: logAnalyzer.total })}</span>
+        <div class="log-pager-buttons">
+          <button type="button" class="btn secondary btn-sm" id="log-page-prev" ${canPrev ? "" : "disabled"}>${tr("logViewer.prev")}</button>
+          <button type="button" class="btn secondary btn-sm" id="log-page-next" ${canNext ? "" : "disabled"}>${tr("logViewer.next")}</button>
+        </div>`;
+      document.getElementById("log-page-prev")?.addEventListener("click", () => {
+        logAnalyzer.offset = Math.max(0, logAnalyzer.offset - LOG_PAGE_SIZE);
+        queryLogEntries();
+      });
+      document.getElementById("log-page-next")?.addEventListener("click", () => {
+        logAnalyzer.offset += LOG_PAGE_SIZE;
+        queryLogEntries();
+      });
+    }
+
+    document.querySelectorAll("#log-table th[data-sort]").forEach((th) => {
+      th.classList.toggle("sort-asc", th.dataset.sort === logAnalyzer.sortBy && logAnalyzer.sortDir === "asc");
+      th.classList.toggle("sort-desc", th.dataset.sort === logAnalyzer.sortBy && logAnalyzer.sortDir === "desc");
+    });
+  }
+
+  function applyLogAnalyzeReady(payload) {
+    setLogLoading(false);
     const meta = document.getElementById("log-content-meta");
-    if (!view) return;
+    const sysBtn = document.getElementById("log-system-btn");
+    const modBtn = document.getElementById("log-mod-btn");
     if (!payload?.success) {
-      view.textContent = payload?.message || tr("logViewer.readFailed");
-      if (meta) meta.textContent = "";
+      if (meta) meta.textContent = payload?.message || tr("logViewer.readFailed");
+      if (sysBtn) sysBtn.disabled = true;
+      if (modBtn) modBtn.disabled = true;
+      renderLogTable({ rows: [], total: 0, offset: 0 });
       return;
     }
-    view.textContent = payload.content || "";
-    if (meta) {
-      meta.textContent = payload.truncated
-        ? `${payload.path || ""} (${tr("logViewer.truncated")})`
-        : (payload.path || "");
+
+    logAnalyzer.path = payload.path || "";
+    logAnalyzer.offset = 0;
+    logAnalyzer.selectedIndex = -1;
+    if (sysBtn) sysBtn.disabled = false;
+    if (modBtn) modBtn.disabled = false;
+
+    const catSel = document.getElementById("log-category-filter");
+    if (catSel) {
+      const current = logAnalyzer.category;
+      const cats = payload.categories || [];
+      catSel.innerHTML = `<option value="">${tr("logViewer.filterAll")}</option>`
+        + cats.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
+      if (current && cats.includes(current)) {
+        catSel.value = current;
+      } else {
+        logAnalyzer.category = "";
+        catSel.value = "";
+      }
     }
-    view.scrollTop = 0;
+
+    if (meta) {
+      const counts = fillTemplate("logViewer.counts", {
+        total: payload.entryCount ?? 0,
+        errors: payload.errorCount ?? 0,
+        warns: payload.warnCount ?? 0
+      });
+      const trunc = payload.truncated
+        ? ` · ${payload.truncationNote || tr("logViewer.truncated")}`
+        : "";
+      meta.textContent = `${payload.fileName || payload.path || ""} · ${payload.sizeLabel || ""} · ${counts}${trunc}`;
+    }
+
+    const list = document.getElementById("log-file-list");
+    list?.querySelectorAll(".log-file-item").forEach((el) => {
+      const name = el.querySelector("strong")?.textContent || "";
+      el.classList.toggle("active", name === payload.fileName);
+    });
+
+    const ctx = document.getElementById("log-context-view");
+    if (ctx) ctx.textContent = "";
+    queryLogEntries();
+  }
+
+  function renderLogContext(payload) {
+    const view = document.getElementById("log-context-view");
+    if (!view) return;
+    if (!payload?.success) {
+      view.textContent = payload?.message || "";
+      return;
+    }
+    const lines = payload.lines || [];
+    view.innerHTML = lines.map((line) => {
+      const cls = [
+        "log-context-line",
+        line.inEntry ? "in-entry" : "",
+        line.selected ? "selected" : ""
+      ].filter(Boolean).join(" ");
+      const num = String(line.number ?? "").padStart(5, " ");
+      return `<div class="${cls}">${escapeHtml(num)}  ${escapeHtml(line.text || "")}</div>`;
+    }).join("");
+    const selected = view.querySelector(".selected");
+    selected?.scrollIntoView({ block: "center" });
+  }
+
+  function hideLogRowMenu() {
+    document.getElementById("log-row-menu")?.classList.add("hidden");
+    logAnalyzer.menuRow = null;
+  }
+
+  async function copyLogText(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        showToast(tr("logViewer.copied"), true);
+        return;
+      }
+    } catch {
+      // fallback
+    }
+    showToast(tr("logViewer.copyFailed"), false);
+  }
+
+  function renderLogSystemInfo(payload) {
+    const body = document.getElementById("log-system-modal-body");
+    const modal = document.getElementById("log-system-modal");
+    if (!body || !modal) return;
+    const specs = payload?.specs || [];
+    if (!specs.length) {
+      body.innerHTML = `<p class="muted">${payload?.message || tr("logViewer.noSystem")}</p>`;
+    } else {
+      body.innerHTML = specs.map((s) =>
+        `<div class="log-info-row"><strong>${escapeHtml(s.label)}</strong><span>${escapeHtml(s.value)}</span></div>`
+      ).join("");
+    }
+    modal.classList.remove("hidden");
+  }
+
+  function renderLogModInfo(payload) {
+    const body = document.getElementById("log-mod-modal-body");
+    const modal = document.getElementById("log-mod-modal");
+    if (!body || !modal) return;
+    const mods = payload?.mods || [];
+    const overrides = payload?.overrides || [];
+    if (!mods.length && !overrides.length) {
+      body.innerHTML = `<p class="muted">${payload?.message || tr("logViewer.noMods")}</p>`;
+    } else {
+      let html = "";
+      if (mods.length) {
+        html += `<div class="log-info-section">${tr("logViewer.modsLoaded")} (${mods.length})</div>`;
+        html += mods.map((m) => {
+          const name = m.displayName && m.displayName !== m.id
+            ? `${escapeHtml(m.displayName)} <span class="muted">(${escapeHtml(m.id)})</span>`
+            : escapeHtml(m.id || m.displayName || "");
+          const ws = m.workshopId
+            ? ` <span class="muted">${tr("logViewer.workshop")} ${escapeHtml(m.workshopId)}</span>`
+            : "";
+          return `<div class="log-info-row"><strong>${name}</strong><span>${ws}</span></div>`;
+        }).join("");
+      }
+      if (overrides.length) {
+        html += `<div class="log-info-section">${tr("logViewer.overrides")} (${overrides.length})</div>`;
+        html += overrides.map((o) => {
+          const name = escapeHtml(o.displayName || o.modId || "");
+          return `<div class="log-info-row"><strong>${name}</strong><span>${escapeHtml(o.path || "")}</span></div>`;
+        }).join("");
+      }
+      body.innerHTML = html;
+    }
+    modal.classList.remove("hidden");
+  }
+
+  function wireLogAnalyzerUi() {
+    document.getElementById("log-level-filters")?.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("[data-level]");
+      if (!btn) return;
+      logAnalyzer.level = btn.getAttribute("data-level") || "";
+      logAnalyzer.offset = 0;
+      document.querySelectorAll("#log-level-filters .log-filter-btn").forEach((el) => {
+        el.classList.toggle("active", el === btn);
+      });
+      if (logAnalyzer.path) queryLogEntries();
+    });
+
+    document.getElementById("log-category-filter")?.addEventListener("change", (ev) => {
+      logAnalyzer.category = ev.target.value || "";
+      logAnalyzer.offset = 0;
+      if (logAnalyzer.path) queryLogEntries();
+    });
+
+    document.getElementById("log-search-input")?.addEventListener("input", (ev) => {
+      logAnalyzer.search = ev.target.value || "";
+      logAnalyzer.offset = 0;
+      clearTimeout(logAnalyzer.searchTimer);
+      logAnalyzer.searchTimer = setTimeout(() => {
+        if (logAnalyzer.path) queryLogEntries();
+      }, 220);
+    });
+
+    document.getElementById("log-table")?.querySelector("thead")?.addEventListener("click", (ev) => {
+      const th = ev.target.closest("th[data-sort]");
+      if (!th) return;
+      const key = th.dataset.sort;
+      if (logAnalyzer.sortBy === key) {
+        logAnalyzer.sortDir = logAnalyzer.sortDir === "asc" ? "desc" : "asc";
+      } else {
+        logAnalyzer.sortBy = key;
+        logAnalyzer.sortDir = key === "timestamp" ? "asc" : "asc";
+      }
+      logAnalyzer.offset = 0;
+      if (logAnalyzer.path) queryLogEntries();
+    });
+
+    document.getElementById("log-table-body")?.addEventListener("click", (ev) => {
+      const tr = ev.target.closest("tr[data-index]");
+      if (!tr) return;
+      const index = Number(tr.dataset.index);
+      logAnalyzer.selectedIndex = index;
+      document.querySelectorAll("#log-table-body tr").forEach((row) => {
+        row.classList.toggle("selected", row === tr);
+      });
+      sendToCSharp("get_log_context", { index });
+    });
+
+    document.getElementById("log-table-body")?.addEventListener("contextmenu", (ev) => {
+      const tr = ev.target.closest("tr[data-index]");
+      if (!tr) return;
+      ev.preventDefault();
+      const index = Number(tr.dataset.index);
+      logAnalyzer.menuRow = logAnalyzer.rows.find((r) => r.index === index) || null;
+      const menu = document.getElementById("log-row-menu");
+      if (!menu || !logAnalyzer.menuRow) return;
+      menu.classList.remove("hidden");
+      const x = Math.min(ev.clientX, window.innerWidth - 220);
+      const y = Math.min(ev.clientY, window.innerHeight - 90);
+      menu.style.left = `${x}px`;
+      menu.style.top = `${y}px`;
+    });
+
+    document.getElementById("log-row-menu")?.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("[data-copy]");
+      if (!btn || !logAnalyzer.menuRow) return;
+      const mode = btn.getAttribute("data-copy");
+      const text = mode === "message" ? (logAnalyzer.menuRow.message || "") : (logAnalyzer.menuRow.raw || "");
+      hideLogRowMenu();
+      copyLogText(text);
+    });
+
+    document.addEventListener("click", (ev) => {
+      if (!ev.target.closest("#log-row-menu")) hideLogRowMenu();
+    });
+
+    document.getElementById("log-system-btn")?.addEventListener("click", () => {
+      sendToCSharp("get_log_system_info");
+    });
+    document.getElementById("log-mod-btn")?.addEventListener("click", () => {
+      sendToCSharp("get_log_mod_info");
+    });
+    document.getElementById("log-system-modal-close")?.addEventListener("click", () => {
+      document.getElementById("log-system-modal")?.classList.add("hidden");
+    });
+    document.getElementById("log-mod-modal-close")?.addEventListener("click", () => {
+      document.getElementById("log-mod-modal")?.classList.add("hidden");
+    });
+    document.getElementById("log-system-modal")?.addEventListener("click", (ev) => {
+      if (ev.target.id === "log-system-modal") ev.currentTarget.classList.add("hidden");
+    });
+    document.getElementById("log-mod-modal")?.addEventListener("click", (ev) => {
+      if (ev.target.id === "log-mod-modal") ev.currentTarget.classList.add("hidden");
+    });
+  }
+
+  function releaseLogAnalyzerSession() {
+    const hadSession = Boolean(logAnalyzer.path) || (logAnalyzer.rows && logAnalyzer.rows.length > 0);
+    logAnalyzer.path = "";
+    logAnalyzer.rows = [];
+    logAnalyzer.total = 0;
+    logAnalyzer.offset = 0;
+    logAnalyzer.selectedIndex = -1;
+    logAnalyzer.menuRow = null;
+    clearTimeout(logAnalyzer.searchTimer);
+
+    const body = document.getElementById("log-table-body");
+    if (body) body.innerHTML = "";
+    const pager = document.getElementById("log-pager");
+    if (pager) pager.innerHTML = "";
+    const meta = document.getElementById("log-content-meta");
+    if (meta) meta.textContent = "";
+    const context = document.getElementById("log-context-view");
+    if (context) context.textContent = "";
+    setLogLoading(false);
+
+    if (hadSession) {
+      sendToCSharp("clear_log_session");
+    }
   }
 
   window.openLogViewerTool = function openLogViewerTool() {
+    ensureLazySetup("logAnalyzer", wireLogAnalyzerUi);
     showToolsPanel("log-viewer-panel");
     sendToCSharp("list_logs");
   };
 
   window.closeLogViewerTool = function closeLogViewerTool() {
+    hideLogRowMenu();
+    releaseLogAnalyzerSession();
     hideToolsPanels();
   };
 
@@ -1632,6 +2474,47 @@
       }
       container.appendChild(row);
     });
+  }
+
+  function renderWhitelist(payload) {
+    const list = document.getElementById("whitelist-list");
+    const meta = document.getElementById("whitelist-meta");
+    const note = document.getElementById("whitelist-open-note");
+    if (note) {
+      note.classList.toggle("hidden", payload?.openJoin !== true);
+    }
+    if (meta) {
+      const world = payload?.worldName || "–";
+      const db = payload?.dbPath || "";
+      const count = (payload?.users || []).length;
+      meta.textContent = db
+        ? `${world} · ${count} · ${db}`
+        : (payload?.message || tr("whitelist.dbMissing"));
+    }
+    if (!list) return;
+    if (payload?.success === false) {
+      list.innerHTML = `<p class="muted">${escapeHtml(payload?.message || tr("whitelist.empty"))}</p>`;
+      return;
+    }
+    const users = payload?.users || [];
+    if (!users.length) {
+      list.innerHTML = `<p class="muted">${escapeHtml(payload?.message && payload.message !== "OK" ? payload.message : tr("whitelist.empty"))}</p>`;
+      return;
+    }
+    list.innerHTML = users.map((u) => {
+      const bits = [];
+      if (u.accessLevel) bits.push(`${tr("whitelist.access")}: ${escapeHtml(u.accessLevel)}`);
+      if (u.steamId) bits.push(`Steam: ${escapeHtml(u.steamId)}`);
+      if (u.banned) bits.push(tr("whitelist.banned"));
+      if (u.extra) bits.push(escapeHtml(u.extra));
+      return `<div class="player-row">
+        <div class="player-row-main">
+          <strong>${escapeHtml(u.username || "")}</strong>
+          <div class="muted">${bits.join(" · ") || "–"}</div>
+        </div>
+        <button type="button" class="btn secondary btn-sm" data-wl-remove="${escapeHtml(u.username || "")}">${tr("whitelist.remove")}</button>
+      </div>`;
+    }).join("");
   }
 
   function runPlayerMenuAction(action, player) {
@@ -1918,6 +2801,24 @@
     document.getElementById("pm-addxp")?.addEventListener("click", () => sendAction("addxp"));
     document.getElementById("pm-wl-add")?.addEventListener("click", () => sendAction("whitelist_add"));
     document.getElementById("pm-wl-remove")?.addEventListener("click", () => sendAction("whitelist_remove"));
+    document.getElementById("wl-add-btn")?.addEventListener("click", () => {
+      const player = document.getElementById("wl-username")?.value?.trim() || "";
+      const password = document.getElementById("wl-password")?.value?.trim() || "";
+      if (!player || !password) {
+        showToast(tr("whitelist.needNamePass"), false);
+        return;
+      }
+      sendToCSharp("player_action", { action: "whitelist_add", player, password });
+    });
+    document.getElementById("whitelist-list")?.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("[data-wl-remove]");
+      if (!btn) return;
+      const name = btn.getAttribute("data-wl-remove") || "";
+      if (!name) return;
+      const ok = confirm((tr("whitelist.confirmRemove") || "").replaceAll("{name}", name));
+      if (!ok) return;
+      sendToCSharp("player_action", { action: "whitelist_remove", player: name });
+    });
     document.getElementById("pm-send-msg")?.addEventListener("click", () => {
       const message = document.getElementById("pm-servermsg")?.value?.trim() || "";
       sendToCSharp("player_action", { action: "servermsg", message });
@@ -1956,7 +2857,7 @@
       <div class="backup-item">
         <div>
           <strong>${b.name || ""}</strong>
-          <div class="muted">${b.createdAt || ""}</div>
+          <div class="muted">${b.createdAt || ""}${b.sizeLabel ? ` · ${b.sizeLabel}` : ""}${b.isZip ? " · zip" : ""}</div>
           <code>${b.path || ""}</code>
         </div>
       </div>
@@ -2031,7 +2932,7 @@
     modal.dataset.openSettingsAfter = openSettingsAfter ? "1" : "0";
   }
 
-  function setupLanguageAndModControls() {
+  function setupLanguageControls() {
     const continueBtn = document.getElementById("language-modal-continue");
     if (continueBtn) {
       continueBtn.addEventListener("click", () => {
@@ -2053,6 +2954,22 @@
       });
     }
 
+    const settingsLang = document.getElementById("settings-ui-language");
+    if (settingsLang) {
+      settingsLang.addEventListener("change", () => {
+        sendToCSharp("set_language", { language: settingsLang.value });
+        applyUiLanguage(settingsLang.value);
+        updateInfoBanners({
+          zomboidDataPath: document.getElementById("settings-zomboid-path")?.value || "",
+          rconHost: document.getElementById("settings-rcon-host")?.value || "",
+          rconPort: document.getElementById("settings-rcon-port")?.value || ""
+        });
+        requestServerStatus({ includePlayers: currentTabName === "server" });
+      });
+    }
+  }
+
+  function setupModListControls() {
     const tilesBtn = document.getElementById("mod-view-tiles");
     const listBtn = document.getElementById("mod-view-list");
     if (tilesBtn) {
@@ -2071,20 +2988,6 @@
         if (container) {
           container.classList.add("list-mode");
         }
-      });
-    }
-
-    const settingsLang = document.getElementById("settings-ui-language");
-    if (settingsLang) {
-      settingsLang.addEventListener("change", () => {
-        sendToCSharp("set_language", { language: settingsLang.value });
-        applyUiLanguage(settingsLang.value);
-        updateInfoBanners({
-          zomboidDataPath: document.getElementById("settings-zomboid-path")?.value || "",
-          rconHost: document.getElementById("settings-rcon-host")?.value || "",
-          rconPort: document.getElementById("settings-rcon-port")?.value || ""
-        });
-        requestServerStatus();
       });
     }
   }
@@ -2197,6 +3100,15 @@
 
     updateInfoBanners(payload);
     applyDiscordSettings(payload);
+
+    const intervalEl = document.getElementById("stats-interval");
+    if (intervalEl && payload.statsIntervalMinutes) {
+      intervalEl.value = String(payload.statsIntervalMinutes);
+    }
+    const retentionEl = document.getElementById("stats-retention");
+    if (retentionEl && payload.statsRetentionDays) {
+      retentionEl.value = String(payload.statsRetentionDays);
+    }
 
     if (payload.version) {
       const el = document.getElementById("app-version");
@@ -2388,7 +3300,7 @@
         rconHost: document.getElementById("settings-rcon-host")?.value || "",
         rconPort: document.getElementById("settings-rcon-port")?.value || ""
       });
-      requestServerStatus();
+      requestServerStatus({ includePlayers: currentTabName === "server" });
       showToast(tr("settings.langSaved"), true);
       return;
     }
@@ -2415,15 +3327,24 @@
       setBackupProgressModal(
         Boolean(message.payload?.active),
         message.payload?.done || 0,
-        message.payload?.file || ""
+        message.payload?.file || "",
+        message.payload?.total || 0,
+        message.payload?.percent
       );
       return;
     }
 
     if (message.type === "backup_result") {
-      setBackupProgressModal(false, 0, "");
+      setBackupProgressModal(false, 0, "", 0, 0);
+      const cancelBtn = document.getElementById("backup-progress-cancel");
+      if (cancelBtn) {
+        cancelBtn.disabled = false;
+        cancelBtn.textContent = tr("backup.cancel");
+      }
       const success = Boolean(message.payload?.success);
-      const text = message.payload?.message || (success ? tr("backup.created") : tr("backup.failed"));
+      const cancelled = Boolean(message.payload?.cancelled);
+      const text = message.payload?.message
+        || (cancelled ? tr("backup.cancelled") : (success ? tr("backup.created") : tr("backup.failed")));
       showToast(text, success);
       return;
     }
@@ -2455,6 +3376,16 @@
       return;
     }
 
+    if (message.type === "stats_history") {
+      applyStatsHistory(message.payload || {});
+      return;
+    }
+
+    if (message.type === "stats_settings_saved") {
+      showToast(tr("stats.saved"), true);
+      return;
+    }
+
     if (message.type === "admin_commands_data") {
       applyAdminCommandsData(message.payload || {});
       return;
@@ -2468,8 +3399,48 @@
       return;
     }
 
+    if (message.type === "log_analyze_progress") {
+      setLogLoading(true, message.payload?.percent);
+      return;
+    }
+
+    if (message.type === "log_analyze_ready") {
+      applyLogAnalyzeReady(message.payload || {});
+      return;
+    }
+
+    if (message.type === "log_entries") {
+      if (message.payload?.success === false) {
+        showToast(message.payload?.message || tr("logViewer.readFailed"), false);
+        renderLogTable({ rows: [], total: 0, offset: 0 });
+        return;
+      }
+      renderLogTable(message.payload?.page || {});
+      return;
+    }
+
+    if (message.type === "log_context") {
+      renderLogContext(message.payload || {});
+      return;
+    }
+
+    if (message.type === "log_system_info") {
+      renderLogSystemInfo(message.payload || {});
+      return;
+    }
+
+    if (message.type === "log_mod_info") {
+      renderLogModInfo(message.payload || {});
+      return;
+    }
+
+    if (message.type === "log_file_selected") {
+      logAnalyzer.path = message.payload?.path || logAnalyzer.path;
+      return;
+    }
+
     if (message.type === "log_content") {
-      applyLogContent(message.payload || {});
+      // Legacy tail view — analyzer uses analyze_log instead.
       return;
     }
 
@@ -2488,6 +3459,11 @@
       return;
     }
 
+    if (message.type === "whitelist_data") {
+      renderWhitelist(message.payload || {});
+      return;
+    }
+
     if (message.type === "player_action_result") {
       const result = document.getElementById("pm-result");
       const success = Boolean(message.payload?.success);
@@ -2497,6 +3473,10 @@
         result.style.color = success ? "var(--success)" : "var(--error)";
       }
       showToast(text || (success ? "OK" : "Failed"), success);
+      if (success && String(message.payload?.command || "").startsWith("adduser")) {
+        const pw = document.getElementById("wl-password");
+        if (pw) pw.value = "";
+      }
       return;
     }
 
@@ -2539,6 +3519,34 @@
       const success = Boolean(message.payload?.success);
       const text = message.payload?.message || (success ? "Saved." : "Save failed.");
       showToast(text, success);
+      return;
+    }
+
+    if (message.type === "config_profiles") {
+      if (message.payload?.success === false) {
+        showToast(message.payload?.message || tr("profiles.empty"), false);
+      }
+      renderConfigProfiles(message.payload || {});
+      return;
+    }
+
+    if (message.type === "config_profile_saved") {
+      showToast(message.payload?.message || tr("profiles.saved"), Boolean(message.payload?.success));
+      return;
+    }
+
+    if (message.type === "config_profile_renamed") {
+      showToast(message.payload?.message || tr("profiles.renamed"), Boolean(message.payload?.success));
+      return;
+    }
+
+    if (message.type === "config_profile_deleted") {
+      showToast(message.payload?.message || tr("profiles.deleted"), Boolean(message.payload?.success));
+      return;
+    }
+
+    if (message.type === "config_profile_loaded") {
+      handleConfigProfileLoaded(message.payload || {});
       return;
     }
 
@@ -2586,20 +3594,30 @@
     });
   }
 
+  /** Run Tools-panel wiring once, on first open — keeps DOMContentLoaded thin. */
+  const lazySetupDone = Object.create(null);
+  function ensureLazySetup(key, fn) {
+    if (lazySetupDone[key]) return;
+    lazySetupDone[key] = true;
+    fn();
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
     setupTabNavigation();
     setupRestartControls();
     setupRconControls();
     setupSettingsControls();
     setupConfigControls();
-    setupLanguageAndModControls();
-    setupPlayersAndDiscordControls();
+    setupLanguageControls();
     setupBroadcastControls();
     setupBackupScheduleControls();
-    setupAdminCommandsControls();
+    setupBackupProgressControls();
+    setupStatsControls();
     setupCSharpBridge();
-    setupStatusPolling();
     applyConfigEditorMode("ini");
     requestSettings();
+    // Deferred until first open of the matching Tools panel:
+    // setupAdminCommandsControls, wireLogAnalyzerUi, setupModListControls,
+    // setupPlayersAndDiscordControls (players/whitelist + Discord).
   });
 })();

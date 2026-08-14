@@ -17,6 +17,7 @@
       <nav class="sidebar-nav">
         <ul>
           <li class="active" data-tab="server" data-i18n="nav.server">🖥️ Server</li>
+          <li data-tab="stats" data-i18n="nav.stats">📈 Statistics</li>
           <li data-tab="restarts" data-i18n="nav.restarts">🔄 Restarts</li>
           <li data-tab="config" data-i18n="nav.config">⚙️ Config</li>
           <li data-tab="rcon" data-i18n="nav.rcon">📡 RCON</li>
@@ -119,6 +120,105 @@
             <div class="form-grid">
               <div class="form-field"><span class="muted" data-i18n="server.ports">Ports</span><div id="hw-ports" class="info-value">–</div></div>
               <div class="form-field"><span class="muted" data-i18n="server.admins">Server admins</span><div id="hw-admins" class="info-value">–</div></div>
+            </div>
+          </div>
+        </div>
+
+        <div id="tab-stats" class="tab-content hidden">
+          <div class="card">
+            <div class="stats-toolbar">
+              <h3 style="margin:0" data-i18n="stats.title">Statistics</h3>
+              <div class="stats-range" id="stats-range">
+                <button type="button" class="log-filter-btn active" data-range="24h" data-i18n="stats.range24h">Last 24h</button>
+                <button type="button" class="log-filter-btn" data-range="7d" data-i18n="stats.range7d">Last 7 days</button>
+                <button type="button" class="log-filter-btn" data-range="30d" data-i18n="stats.range30d">Last 30 days</button>
+              </div>
+            </div>
+            <p class="muted" data-i18n="stats.hint">Historical trends while the dedicated server is running. Live CPU/RAM/disk stay on the Server tab.</p>
+          </div>
+
+          <div class="info-grid stats-kpi-grid">
+            <div class="card info-box">
+              <div class="info-label" data-i18n="stats.uptime">Uptime</div>
+              <div id="stats-uptime-pct" class="info-value stats-kpi">–</div>
+              <div id="stats-uptime-detail" class="muted" style="margin:8px 0 0"></div>
+            </div>
+            <div class="card info-box">
+              <div class="info-label" data-i18n="stats.unexpected">Unexpected downtime</div>
+              <div id="stats-unexpected" class="info-value stats-kpi">–</div>
+              <div id="stats-planned" class="muted" style="margin:8px 0 0"></div>
+            </div>
+            <div class="card info-box">
+              <div class="info-label" data-i18n="stats.samples">Samples</div>
+              <div id="stats-sample-count" class="info-value stats-kpi">–</div>
+              <div id="stats-disk-latest" class="muted" style="margin:8px 0 0"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3 data-i18n="stats.playersChart">Players over time</h3>
+            <div class="stats-chart-wrap">
+              <canvas id="stats-players-chart" class="stats-chart" width="900" height="260"></canvas>
+              <div id="stats-players-empty" class="stats-empty hidden" data-i18n="stats.empty">No history yet. Data is recorded automatically while the server is running.</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3 data-i18n="stats.hwChart">CPU &amp; RAM over time</h3>
+            <div class="stats-chart-wrap">
+              <canvas id="stats-hw-chart" class="stats-chart" width="900" height="260"></canvas>
+              <div id="stats-hw-empty" class="stats-empty hidden" data-i18n="stats.empty">No history yet. Data is recorded automatically while the server is running.</div>
+            </div>
+            <div class="stats-legend">
+              <span><i class="stats-swatch" style="background:#46c882"></i> <span data-i18n="stats.cpu">CPU %</span></span>
+              <span><i class="stats-swatch" style="background:#f0b43c"></i> <span data-i18n="stats.ram">RAM %</span></span>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3 data-i18n="stats.restartsTitle">Restart history</h3>
+            <div class="log-table-wrap">
+              <table class="log-table stats-restart-table">
+                <thead>
+                  <tr>
+                    <th data-i18n="stats.colTime">Time</th>
+                    <th data-i18n="stats.colReason">Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="stats-restart-body">
+                  <tr><td colspan="2" class="muted" data-i18n="stats.noRestarts">No restarts recorded in this range.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3 data-i18n="stats.collectionTitle">Data collection</h3>
+            <p class="muted" data-i18n="stats.collectionHint">Samples are taken only while the server is online. Older rows are pruned automatically.</p>
+            <div class="form-grid">
+              <label class="form-field">
+                <span data-i18n="stats.interval">Sample interval</span>
+                <select id="stats-interval">
+                  <option value="1">1 min</option>
+                  <option value="2" selected>2 min</option>
+                  <option value="3">3 min</option>
+                  <option value="4">4 min</option>
+                  <option value="5">5 min</option>
+                </select>
+              </label>
+              <label class="form-field">
+                <span data-i18n="stats.retention">Keep history</span>
+                <select id="stats-retention">
+                  <option value="7">7 days</option>
+                  <option value="14">14 days</option>
+                  <option value="30" selected>30 days</option>
+                  <option value="90">90 days</option>
+                </select>
+              </label>
+            </div>
+            <div class="button-row">
+              <button class="btn" type="button" id="stats-save-settings" data-i18n="stats.save">💾 Save collection settings</button>
+              <button class="btn secondary" type="button" id="stats-refresh" data-i18n="stats.refresh">🔄 Refresh</button>
             </div>
           </div>
         </div>
@@ -258,6 +358,20 @@
             </label>
           </div>
 
+          <div class="card" id="config-profiles-card">
+            <div class="button-row" style="justify-content: space-between; align-items: center;">
+              <div>
+                <h3 style="margin:0" data-i18n="profiles.title">📂 Config Profiles</h3>
+                <p class="muted" style="margin:4px 0 0" data-i18n="profiles.hint">Save named snapshots of your current server.ini + SandboxVars.lua and switch between them.</p>
+              </div>
+              <div class="button-row" style="margin:0">
+                <button class="btn" type="button" id="profile-save-btn" data-i18n="profiles.saveCurrent">💾 Save Current as Profile</button>
+                <button class="btn secondary" type="button" id="profile-refresh-btn" data-i18n="profiles.refresh">🔄 Refresh</button>
+              </div>
+            </div>
+            <div id="config-profiles-list" class="config-profiles-list" style="margin-top:14px"></div>
+          </div>
+
           <div id="config-ini-section">
             <div class="card">
               <h3 data-i18n="config.title">Server Configuration</h3>
@@ -380,8 +494,8 @@
               <p data-i18n="tools.adminCommandsDesc">Build 42 admin commands with English/German search</p>
             </div>
             <div class="card tool-card" onclick="openLogViewerTool()">
-              <h3>📜 <span data-i18n="tools.logViewer">Log Viewer</span></h3>
-              <p data-i18n="tools.logViewerDesc">Browse important server and Zomboid log files</p>
+              <h3>📜 <span data-i18n="tools.logViewer">Log Analyzer</span></h3>
+              <p data-i18n="tools.logViewerDesc">Parse, filter and inspect server and Zomboid log files</p>
             </div>
           </div>
 
@@ -487,6 +601,33 @@
               <input id="pm-search" type="search" autocomplete="off" placeholder="Filter by name…" data-i18n-placeholder="players.searchPlaceholder" />
             </label>
             <div id="players-list" class="players-list" style="margin-top:12px"></div>
+
+            <div class="card" id="whitelist-card" style="margin-top:16px">
+              <div class="button-row" style="justify-content:space-between;align-items:center">
+                <div>
+                  <h4 style="margin:0" data-i18n="whitelist.title">Whitelist</h4>
+                  <p class="muted" style="margin:4px 0 0" data-i18n="whitelist.hint">Accounts in db/{world}.db. Add/remove uses RCON (adduser / removeuserfromwhitelist). Requires the server to be running.</p>
+                </div>
+                <button class="btn secondary btn-sm" type="button" onclick="sendToCSharp('get_whitelist')" data-i18n="whitelist.refresh">🔄 Refresh</button>
+              </div>
+              <div id="whitelist-open-note" class="info-banner hidden" style="margin-top:12px" data-i18n="whitelist.openNote">Whitelist is configured but the server currently allows open join (Open=true in server settings). Change this in Config if you want to enforce the whitelist.</div>
+              <div id="whitelist-meta" class="muted" style="margin-top:8px"></div>
+              <div id="whitelist-list" class="players-list" style="margin-top:12px"></div>
+              <div class="form-grid" style="margin-top:12px">
+                <label class="form-field">
+                  <span data-i18n="whitelist.username">Username</span>
+                  <input id="wl-username" type="text" autocomplete="off" />
+                </label>
+                <label class="form-field">
+                  <span data-i18n="whitelist.password">Password</span>
+                  <input id="wl-password" type="password" autocomplete="new-password" />
+                </label>
+              </div>
+              <div class="button-row" style="margin-top:12px">
+                <button class="btn" type="button" id="wl-add-btn" data-i18n="whitelist.add">Add User to Whitelist</button>
+              </div>
+            </div>
+
             <div class="card" style="margin-top:16px">
               <h4 data-i18n="players.actions">Actions</h4>
               <div class="form-grid">
@@ -647,10 +788,11 @@
           <div id="log-viewer-panel" class="card hidden">
             <div class="button-row" style="justify-content: space-between; align-items: center;">
               <div>
-                <h3 style="margin:0" data-i18n="logViewer.title">📜 Log Viewer</h3>
-                <p class="muted" style="margin:4px 0 0" data-i18n="logViewer.hint">Shows important logs from the server logs folder and Zomboid\Logs.</p>
+                <h3 style="margin:0" data-i18n="logViewer.title">📜 Log Analyzer</h3>
+                <p class="muted" style="margin:4px 0 0" data-i18n="logViewer.hint">Parse logs from the server logs folder and Zomboid\Logs.</p>
               </div>
               <div class="button-row" style="margin:0">
+                <button class="btn secondary" type="button" onclick="sendToCSharp('browse_log_file')" data-i18n="logViewer.openFile">📂 Open file</button>
                 <button class="btn secondary" type="button" onclick="sendToCSharp('list_logs')" data-i18n="logViewer.refresh">🔄 Refresh</button>
                 <button class="btn secondary" type="button" onclick="closeLogViewerTool()" data-i18n="logViewer.close">✕ Close</button>
               </div>
@@ -658,10 +800,57 @@
             <div id="log-viewer-paths" class="muted" style="margin-top:10px"></div>
             <div class="log-viewer-layout" style="margin-top:14px">
               <div id="log-file-list" class="log-file-list"></div>
-              <div class="log-content-wrap">
+              <div class="log-analyzer-main">
+                <div class="log-analyzer-toolbar">
+                  <div class="log-level-filters" id="log-level-filters">
+                    <button type="button" class="log-filter-btn active" data-level="" data-i18n="logViewer.filterAll">All</button>
+                    <button type="button" class="log-filter-btn" data-level="LOG">LOG</button>
+                    <button type="button" class="log-filter-btn log-filter-warn" data-level="WARN">WARN</button>
+                    <button type="button" class="log-filter-btn log-filter-error" data-level="ERROR">ERROR</button>
+                  </div>
+                  <label class="form-field log-category-field">
+                    <span data-i18n="logViewer.category">Category</span>
+                    <select id="log-category-filter">
+                      <option value="">All</option>
+                    </select>
+                  </label>
+                  <label class="form-field log-search-field">
+                    <span data-i18n="logViewer.search">Search</span>
+                    <input id="log-search-input" type="search" data-i18n-placeholder="logViewer.searchPlaceholder" placeholder="Search message…" autocomplete="off" />
+                  </label>
+                  <div class="log-analyzer-actions">
+                    <button class="btn secondary btn-sm" type="button" id="log-system-btn" disabled data-i18n="logViewer.systemInfo">System Info</button>
+                    <button class="btn secondary btn-sm" type="button" id="log-mod-btn" disabled data-i18n="logViewer.modInfo">Mod Info</button>
+                  </div>
+                </div>
                 <div id="log-content-meta" class="muted" style="margin-bottom:8px"></div>
-                <pre id="log-content-view" class="log-content-view"></pre>
+                <div class="log-table-wrap" id="log-table-wrap">
+                  <div id="log-loading" class="log-loading hidden">
+                    <div class="progress-track"><div class="progress-bar indeterminate" id="log-progress-bar"></div></div>
+                    <p class="muted" id="log-loading-text" data-i18n="logViewer.loading">Parsing log file…</p>
+                  </div>
+                  <table class="log-table" id="log-table">
+                    <thead>
+                      <tr>
+                        <th data-sort="timestamp" data-i18n="logViewer.colTime">Timestamp</th>
+                        <th data-sort="level" data-i18n="logViewer.colLevel">Level</th>
+                        <th data-sort="category" data-i18n="logViewer.colCategory">Category</th>
+                        <th data-sort="message" data-i18n="logViewer.colMessage">Message</th>
+                      </tr>
+                    </thead>
+                    <tbody id="log-table-body"></tbody>
+                  </table>
+                </div>
+                <div class="log-pager" id="log-pager"></div>
+                <div class="log-context-panel" id="log-context-panel">
+                  <div class="muted" style="margin-bottom:6px" data-i18n="logViewer.contextHint">Select a row to see surrounding raw lines.</div>
+                  <pre id="log-context-view" class="log-context-view"></pre>
+                </div>
               </div>
+            </div>
+            <div id="log-row-menu" class="log-row-menu hidden">
+              <button type="button" data-copy="raw" data-i18n="logViewer.copyLine">Copy full line</button>
+              <button type="button" data-copy="message" data-i18n="logViewer.copyMessage">Copy message only</button>
             </div>
           </div>
         </div>
@@ -777,12 +966,35 @@
     </div>
   </div>
 
-  <div id="backup-progress-modal" class="modal hidden">
-    <div class="modal-card">
-      <h2 data-i18n="backup.progressTitle">Backup wird erstellt…</h2>
-      <p class="muted" id="backup-progress-file" data-i18n="backup.progressWait">Please wait while files are copied.</p>
-      <div class="progress-track"><div class="progress-bar indeterminate" id="backup-progress-bar"></div></div>
+  <div id="backup-progress-modal" class="backup-progress-float hidden">
+    <div class="backup-progress-card">
+      <h2 data-i18n="backup.progressTitle">Creating backup…</h2>
+      <p class="muted" id="backup-progress-file" data-i18n="backup.progressWait">Compressing save files into a zip archive…</p>
+      <div class="progress-track"><div class="progress-bar" id="backup-progress-bar" style="width:0%"></div></div>
       <p class="muted" id="backup-progress-count"></p>
+      <div class="button-row" style="margin-top:12px;justify-content:flex-end">
+        <button class="btn secondary" type="button" id="backup-progress-cancel" data-i18n="backup.cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="log-system-modal" class="modal hidden">
+    <div class="modal-card modal-card-wide">
+      <div class="button-row" style="justify-content:space-between;align-items:center">
+        <h2 style="margin:0" data-i18n="logViewer.systemInfoTitle">System info</h2>
+        <button class="btn secondary" type="button" id="log-system-modal-close" data-i18n="logViewer.close">✕ Close</button>
+      </div>
+      <div id="log-system-modal-body" class="log-info-list" style="margin-top:12px"></div>
+    </div>
+  </div>
+
+  <div id="log-mod-modal" class="modal hidden">
+    <div class="modal-card modal-card-wide">
+      <div class="button-row" style="justify-content:space-between;align-items:center">
+        <h2 style="margin:0" data-i18n="logViewer.modInfoTitle">Mods in this log</h2>
+        <button class="btn secondary" type="button" id="log-mod-modal-close" data-i18n="logViewer.close">✕ Close</button>
+      </div>
+      <div id="log-mod-modal-body" class="log-info-list" style="margin-top:12px"></div>
     </div>
   </div>
 

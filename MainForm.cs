@@ -25,31 +25,53 @@ public partial class MainForm : Form
     private readonly ServerProcessManager _serverProcessManager = new();
     private readonly BroadcastManager _broadcastManager = new();
     private readonly BackupScheduler _backupScheduler = new();
+    private readonly SchedulerHeartbeat _schedulerHeartbeat = new();
     private readonly HardwareMonitor _hardwareMonitor = new();
+    private readonly StatsHistoryStore _statsHistory = new();
+    private readonly StatsCollector _statsCollector;
     private readonly ModUpdateRestartFlow _modUpdateRestartFlow = new();
     private readonly System.Windows.Forms.Timer _hardwareTimer;
     private readonly System.Windows.Forms.Timer _modUpdatePollTimer;
     private readonly System.Windows.Forms.Timer _modUpdateStatusTimer;
     private bool _hardwarePollingActive;
+    private bool _deferredServicesStarted;
+    private List<object> _cachedHardwarePorts = new();
     private bool _modUpdateCheckInFlight;
+    private bool _userStopInProgress;
+    private readonly Stopwatch _startupWatch = Stopwatch.StartNew();
 
     private AppConfig _config;
     private WebView2 _webView = null!;
     private DateTime? _lastRestartTime;
     private bool _restartInProgress;
     private readonly bool _isFirstStart;
-    private readonly System.Windows.Forms.Timer _discordCustomTimer;
     private int? _lastDiscordCustomHour;
     private bool _backupInProgress;
+    private CancellationTokenSource? _backupCts;
     private readonly HashSet<int> _broadcastInFlight = new();
+    private LogAnalyzeSession? _logSession;
+    private CancellationTokenSource? _logAnalyzeCts;
+    private readonly object _logAnalyzeLock = new();
 
     public MainForm()
     {
         _config = ConfigManager.Load();
         _config.DiscordEvents = DiscordEventCatalog.Normalize(_config.DiscordEvents, _config.DiscordCustomMessage);
         _config.ModUpdateAutoRestart ??= new ModUpdateAutoRestartConfig();
+        _config.StatsIntervalMinutes = StatsHistoryStore.ClampIntervalMinutes(
+            _config.StatsIntervalMinutes <= 0 ? StatsHistoryStore.DefaultIntervalMinutes : _config.StatsIntervalMinutes);
+        _config.StatsRetentionDays = StatsHistoryStore.ClampRetentionDays(
+            _config.StatsRetentionDays <= 0 ? StatsHistoryStore.DefaultRetentionDays : _config.StatsRetentionDays);
         _isFirstStart = string.IsNullOrWhiteSpace(_config.ServerPath)
             || string.IsNullOrWhiteSpace(_config.UiLanguage);
+
+        _statsCollector = new StatsCollector(
+            _statsHistory,
+            IsJavaServerOnline,
+            () => _hardwareMonitor.GetCachedOrSample(_config.ServerPath),
+            TryGetPlayerCountAsync,
+            () => _config.StatsIntervalMinutes,
+            () => _config.StatsRetentionDays);
 
         InitializeComponent();
 
@@ -74,12 +96,10 @@ public partial class MainForm : Form
         RestoreSchedulerFromConfig();
         RestoreBroadcastFromConfig();
         RestoreBackupScheduleFromConfig();
+        // SchedulerHeartbeat + StatsCollector start after WebView is interactive
+        // (see StartDeferredBackgroundServices) so ctor stays light.
 
-        _discordCustomTimer = new System.Windows.Forms.Timer { Interval = 20000 };
-        _discordCustomTimer.Tick += OnDiscordCustomTimerTick;
-        _discordCustomTimer.Start();
-
-        _hardwareTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+        _hardwareTimer = new System.Windows.Forms.Timer { Interval = 3000 };
         _hardwareTimer.Tick += (_, _) =>
         {
             if (_hardwarePollingActive)
@@ -152,11 +172,19 @@ public partial class MainForm : Form
     private void RestoreBroadcastFromConfig()
     {
         _config.BroadcastMessages = BroadcastManager.Normalize(_config.BroadcastMessages);
+        DateTime?[] previousNextSendAt = _config.BroadcastMessages
+            .Select(s => s.NextSendAt)
+            .ToArray();
+
         _broadcastManager.UpdateSlots(_config.BroadcastMessages);
-        // Persist recalculated next-send times from startup.
         _config.BroadcastMessages = _broadcastManager.Slots.ToList();
-        ConfigManager.Save(_config);
-        _broadcastManager.Start();
+
+        // Only persist when recalculated NextSendAt values actually changed.
+        bool nextSendChanged = !_config.BroadcastMessages
+            .Select(s => s.NextSendAt)
+            .SequenceEqual(previousNextSendAt);
+        if (nextSendChanged)
+            ConfigManager.Save(_config);
     }
 
     private void WireBackupSchedulerEvents()
@@ -179,7 +207,33 @@ public partial class MainForm : Form
     {
         _config.BackupSchedule = BackupScheduler.Normalize(_config.BackupSchedule);
         _backupScheduler.UpdateSchedule(_config.BackupSchedule);
-        _backupScheduler.Start();
+    }
+
+    private void StartSchedulerHeartbeat()
+    {
+        _schedulerHeartbeat.Register(() => _scheduleManager.Tick());
+        _schedulerHeartbeat.Register(() => _backupScheduler.Tick());
+        _schedulerHeartbeat.Register(() => _broadcastManager.Tick());
+        _schedulerHeartbeat.Register(TickDiscordCustomHourly);
+        _schedulerHeartbeat.Start();
+    }
+
+    /// <summary>
+    /// Start schedule heartbeat + stats sampling as soon as the UI is ready —
+    /// not in the constructor — so launch stays responsive without missing due work.
+    /// </summary>
+    private void StartDeferredBackgroundServices()
+    {
+        if (_deferredServicesStarted)
+            return;
+        _deferredServicesStarted = true;
+
+        StartSchedulerHeartbeat();
+        _statsCollector.Start();
+
+        Debug.WriteLine(
+            $"[startup] deferred services started at {_startupWatch.ElapsedMilliseconds} ms " +
+            $"(heartbeat + StatsCollector)");
     }
 
     private void WireScheduleEvents()
@@ -197,7 +251,7 @@ public partial class MainForm : Form
             _ = NotifyDiscordEventAsync(
                 DiscordEventCatalog.ScheduledRestart,
                 new Dictionary<string, string> { ["hour"] = hour.ToString("00") });
-            _ = ExecuteRestartRoutine();
+            _ = ExecuteRestartRoutine(RestartReasons.Scheduled);
         };
         _scheduleManager.WarningAnnouncementTriggered += minutesBefore =>
         {
@@ -223,7 +277,10 @@ public partial class MainForm : Form
             try
             {
                 SendToWeb("server_console", new { line = "[server process exited]" });
-                _ = HandleGetServerStatusAsync();
+                if (!_restartInProgress && !_userStopInProgress)
+                    _statsCollector.NotifyUnexpectedExit();
+                // Cheap online/offline only — may fire while Server tab is hidden.
+                _ = HandleGetServerStatusAsync(includePlayers: false);
             }
             catch
             {
@@ -259,12 +316,17 @@ public partial class MainForm : Form
         if (!File.Exists(htmlPath))
             throw new FileNotFoundException("UI files not found.", htmlPath);
 
-        _webView.CoreWebView2.Navigate(new Uri(htmlPath).AbsoluteUri);
+        // Subscribe before Navigate so a fast first load cannot miss the event.
         _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
         _webView.CoreWebView2.NavigationCompleted += (_, args) =>
         {
             if (!args.IsSuccess)
                 return;
+
+            StartDeferredBackgroundServices();
+            Debug.WriteLine(
+                $"[startup] WebView NavigationCompleted at {_startupWatch.ElapsedMilliseconds} ms");
+
             SendToWeb("app_info", new { version = CurrentVersion });
             if (Environment.GetCommandLineArgs().Any(a =>
                     string.Equals(a, "--selftest-admin-commands", StringComparison.OrdinalIgnoreCase)))
@@ -272,6 +334,7 @@ public partial class MainForm : Form
                 _ = RunAdminCommandsSelfTestAsync();
             }
         };
+        _webView.CoreWebView2.Navigate(new Uri(htmlPath).AbsoluteUri);
 
         if (_isFirstStart)
         {
@@ -321,11 +384,11 @@ public partial class MainForm : Form
             switch (message.Action)
             {
                 case "get_server_status":
-                    _ = HandleGetServerStatusAsync();
+                    _ = HandleGetServerStatusAsync(ReadIncludePlayersFlag(message.Data));
                     break;
 
                 case "manual_restart":
-                    _ = ExecuteRestartRoutine();
+                    _ = ExecuteRestartRoutine(RestartReasons.Manual);
                     break;
 
                 case "save_hours":
@@ -420,6 +483,26 @@ public partial class MainForm : Form
                     HandleSaveIniFile(message.Data);
                     break;
 
+                case "list_config_profiles":
+                    HandleListConfigProfiles();
+                    break;
+
+                case "save_config_profile":
+                    HandleSaveConfigProfile(message.Data);
+                    break;
+
+                case "load_config_profile":
+                    HandleLoadConfigProfile(message.Data);
+                    break;
+
+                case "rename_config_profile":
+                    HandleRenameConfigProfile(message.Data);
+                    break;
+
+                case "delete_config_profile":
+                    HandleDeleteConfigProfile(message.Data);
+                    break;
+
                 case "get_mod_list":
                     HandleGetModList();
                     break;
@@ -455,6 +538,10 @@ public partial class MainForm : Form
                     _ = HandleCreateBackupAsync();
                     break;
 
+                case "cancel_backup":
+                    CancelBackupInProgress();
+                    break;
+
                 case "list_backups":
                     HandleListBackups();
                     break;
@@ -479,12 +566,48 @@ public partial class MainForm : Form
                     PushHardwareStats();
                     break;
 
+                case "get_stats_history":
+                    HandleGetStatsHistory(message.Data);
+                    break;
+
+                case "save_stats_settings":
+                    HandleSaveStatsSettings(message.Data);
+                    break;
+
                 case "list_logs":
                     HandleListLogs();
                     break;
 
+                case "clear_log_session":
+                    ClearLogAnalyzeSession();
+                    break;
+
                 case "read_log":
                     HandleReadLog(message.Data);
+                    break;
+
+                case "analyze_log":
+                    HandleAnalyzeLog(message.Data);
+                    break;
+
+                case "query_log_entries":
+                    HandleQueryLogEntries(message.Data);
+                    break;
+
+                case "get_log_context":
+                    HandleGetLogContext(message.Data);
+                    break;
+
+                case "get_log_system_info":
+                    HandleGetLogSystemInfo();
+                    break;
+
+                case "get_log_mod_info":
+                    HandleGetLogModInfo();
+                    break;
+
+                case "browse_log_file":
+                    BrowseLogFile();
                     break;
 
                 case "get_admin_commands":
@@ -505,6 +628,10 @@ public partial class MainForm : Form
 
                 case "get_player_list":
                     _ = HandleGetPlayerListAsync();
+                    break;
+
+                case "get_whitelist":
+                    HandleGetWhitelist();
                     break;
 
                 case "player_action":
@@ -815,6 +942,7 @@ public partial class MainForm : Form
 
     private async Task HandleStopServerAsync()
     {
+        _userStopInProgress = true;
         try
         {
             SendToWeb("server_console", new { line = "Stopping via RCON quit..." });
@@ -834,6 +962,23 @@ public partial class MainForm : Form
         {
             SendToWeb("server_action_result", new { success = false, message = ex.Message });
         }
+        finally
+        {
+            _userStopInProgress = false;
+        }
+    }
+
+    private void CancelBackupInProgress()
+    {
+        try
+        {
+            _backupCts?.Cancel();
+            SendToWeb("log", "Backup cancel requested.");
+        }
+        catch
+        {
+            // ignore
+        }
     }
 
     private async Task HandleCreateBackupAsync(bool fromScheduler = false)
@@ -849,21 +994,55 @@ public partial class MainForm : Form
         }
 
         _backupInProgress = true;
-        SendToWeb("backup_progress", new { active = true, done = 0, file = "" });
+        _backupCts?.Dispose();
+        _backupCts = new CancellationTokenSource();
+        CancellationToken token = _backupCts.Token;
+
+        SendToWeb("backup_progress", new
+        {
+            active = true,
+            done = 0,
+            total = 0,
+            percent = 0,
+            file = "",
+            cancellable = true
+        });
 
         AppConfig snapshot = CloneConfigForBackup(_config);
         try
         {
-            var progress = new Progress<(int done, string file)>(p =>
+            var progress = new Progress<BackupProgressUpdate>(p =>
             {
-                SendToWeb("backup_progress", new { active = true, done = p.done, file = p.file });
+                if (token.IsCancellationRequested)
+                    return;
+                SendToWeb("backup_progress", new
+                {
+                    active = true,
+                    done = p.Done,
+                    total = p.Total,
+                    percent = p.Percent,
+                    file = p.CurrentFile,
+                    cancellable = true
+                });
             });
 
-            BackupResult result = await Task.Run(() => BackupManager.CreateBackup(snapshot, progress));
-            SendToWeb("backup_progress", new { active = false, done = result.FileCount, file = "" });
+            BackupResult result = await Task.Run(
+                () => BackupManager.CreateBackup(snapshot, progress, token),
+                token).ConfigureAwait(true);
+
+            SendToWeb("backup_progress", new
+            {
+                active = false,
+                done = result.FileCount,
+                total = result.FileCount,
+                percent = result.Success ? 100 : 0,
+                file = "",
+                cancellable = false
+            });
             SendToWeb("backup_result", new
             {
                 success = result.Success,
+                cancelled = result.Cancelled,
                 message = result.Message,
                 path = result.Path,
                 fileCount = result.FileCount
@@ -879,19 +1058,56 @@ public partial class MainForm : Form
             }
             else if (fromScheduler)
             {
-                SendToWeb("log", $"Scheduled backup failed: {result.Message}");
+                SendToWeb("log", result.Cancelled
+                    ? "Scheduled backup cancelled."
+                    : $"Scheduled backup failed: {result.Message}");
             }
+        }
+        catch (OperationCanceledException)
+        {
+            SendToWeb("backup_progress", new
+            {
+                active = false,
+                done = 0,
+                total = 0,
+                percent = 0,
+                file = "",
+                cancellable = false
+            });
+            SendToWeb("backup_result", new
+            {
+                success = false,
+                cancelled = true,
+                message = "Backup cancelled."
+            });
+            if (fromScheduler)
+                SendToWeb("log", "Scheduled backup cancelled.");
         }
         catch (Exception ex)
         {
-            SendToWeb("backup_progress", new { active = false, done = 0, file = "" });
-            SendToWeb("backup_result", new { success = false, message = ex.Message });
+            SendToWeb("backup_progress", new
+            {
+                active = false,
+                done = 0,
+                total = 0,
+                percent = 0,
+                file = "",
+                cancellable = false
+            });
+            SendToWeb("backup_result", new
+            {
+                success = false,
+                cancelled = false,
+                message = ex.Message
+            });
             if (fromScheduler)
                 SendToWeb("log", $"Scheduled backup failed: {ex.Message}");
         }
         finally
         {
             _backupInProgress = false;
+            try { _backupCts?.Dispose(); } catch { /* ignore */ }
+            _backupCts = null;
         }
     }
 
@@ -910,7 +1126,9 @@ public partial class MainForm : Form
             {
                 name = b.Name,
                 path = b.Path,
-                createdAt = b.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss")
+                createdAt = b.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss"),
+                isZip = b.IsZip,
+                sizeLabel = b.IsZip && b.SizeBytes > 0 ? FormatSize(b.SizeBytes) : ""
             })
         });
     }
@@ -1080,6 +1298,7 @@ public partial class MainForm : Form
                 }
 
                 ConfigManager.Save(_config);
+                RefreshHardwareStaticCache();
 
                 SendToWeb("server_folder_selected", new
                 {
@@ -1197,6 +1416,7 @@ public partial class MainForm : Form
                 }
 
                 ConfigManager.Save(_config);
+                RefreshHardwareStaticCache();
                 SendToWeb("start_bat_selected", new
                 {
                     startBat = _config.StartBat,
@@ -1256,12 +1476,153 @@ public partial class MainForm : Form
 
             _config.LastIniFilePath = path;
             ConfigManager.Save(_config);
+            RefreshHardwareStaticCache();
         }
         catch (Exception ex)
         {
             Debug.WriteLine($"Failed to load INI: {ex.Message}");
         }
     }
+
+    private void HandleListConfigProfiles()
+    {
+        try
+        {
+            List<ConfigProfileInfo> profiles = ConfigProfileManager.ListProfiles();
+            SendToWeb("config_profiles", new
+            {
+                success = true,
+                profiles = profiles.Select(ToProfileDto)
+            });
+        }
+        catch (Exception ex)
+        {
+            SendToWeb("config_profiles", new { success = false, message = ex.Message, profiles = Array.Empty<object>() });
+        }
+    }
+
+    private void HandleSaveConfigProfile(JsonElement data)
+    {
+        try
+        {
+            string name = ReadJsonString(data, "name");
+            ConfigProfileInfo info = ConfigProfileManager.SaveCurrentAsProfile(name, _config);
+            SendToWeb("config_profile_saved", new
+            {
+                success = true,
+                message = $"Profile '{info.Name}' saved.",
+                profile = ToProfileDto(info)
+            });
+            HandleListConfigProfiles();
+        }
+        catch (Exception ex)
+        {
+            SendToWeb("config_profile_saved", new { success = false, message = ex.Message });
+        }
+    }
+
+    private void HandleLoadConfigProfile(JsonElement data)
+    {
+        try
+        {
+            string id = ReadJsonString(data, "id");
+            (ConfigProfileInfo info, string iniPath, string sandboxPath) =
+                ConfigProfileManager.ApplyProfile(id, _config);
+
+            _config.LastIniFilePath = iniPath;
+            ConfigManager.Save(_config);
+            RefreshHardwareStaticCache();
+
+            // Refresh editors with the newly applied files
+            try
+            {
+                Dictionary<string, string> rawIni = IniManager.ReadIni(iniPath);
+                SendToWeb("ini_loaded", new { path = iniPath, entries = IniManager.ParseToEntries(rawIni) });
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Reload INI after profile apply failed: {ex.Message}");
+            }
+
+            try
+            {
+                Dictionary<string, string> rawSandbox = SandboxManager.ReadSandbox(sandboxPath);
+                SendToWeb("sandbox_loaded", new
+                {
+                    success = true,
+                    path = sandboxPath,
+                    entries = SandboxManager.ParseToEntries(rawSandbox)
+                });
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Reload Sandbox after profile apply failed: {ex.Message}");
+            }
+
+            SendToWeb("config_profile_loaded", new
+            {
+                success = true,
+                message = $"Profile '{info.Name}' applied.",
+                profileName = info.Name,
+                iniPath,
+                sandboxPath,
+                profile = ToProfileDto(info)
+            });
+            HandleListConfigProfiles();
+        }
+        catch (Exception ex)
+        {
+            SendToWeb("config_profile_loaded", new { success = false, message = ex.Message });
+        }
+    }
+
+    private void HandleRenameConfigProfile(JsonElement data)
+    {
+        try
+        {
+            string id = ReadJsonString(data, "id");
+            string name = ReadJsonString(data, "name");
+            ConfigProfileInfo info = ConfigProfileManager.RenameProfile(id, name);
+            SendToWeb("config_profile_renamed", new
+            {
+                success = true,
+                message = $"Profile renamed to '{info.Name}'.",
+                profile = ToProfileDto(info)
+            });
+            HandleListConfigProfiles();
+        }
+        catch (Exception ex)
+        {
+            SendToWeb("config_profile_renamed", new { success = false, message = ex.Message });
+        }
+    }
+
+    private void HandleDeleteConfigProfile(JsonElement data)
+    {
+        try
+        {
+            string id = ReadJsonString(data, "id");
+            ConfigProfileManager.DeleteProfile(id);
+            SendToWeb("config_profile_deleted", new { success = true, message = "Profile deleted.", id });
+            HandleListConfigProfiles();
+        }
+        catch (Exception ex)
+        {
+            SendToWeb("config_profile_deleted", new { success = false, message = ex.Message });
+        }
+    }
+
+    private static object ToProfileDto(ConfigProfileInfo p) => new
+    {
+        id = p.Id,
+        name = p.Name,
+        created = p.CreatedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"),
+        lastApplied = p.LastAppliedUtc?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "",
+        iniFileName = p.IniFileName,
+        sandboxFileName = p.SandboxFileName,
+        hasIni = p.HasIni,
+        hasSandbox = p.HasSandbox
+    };
 
     private void HandleSaveIniFile(JsonElement data)
     {
@@ -1278,6 +1639,9 @@ public partial class MainForm : Form
                 throw new ArgumentException("Could not deserialize INI values.");
 
             IniManager.WriteIni(path, values);
+            if (!string.IsNullOrWhiteSpace(path))
+                _config.LastIniFilePath = path;
+            RefreshHardwareStaticCache();
             SendToWeb("ini_saved", new { success = true, message = "Konfiguration gespeichert!" });
         }
         catch (Exception ex)
@@ -1428,6 +1792,23 @@ public partial class MainForm : Form
         _config.StartBat = GetString("startBat", _config.StartBat);
         _config.ZomboidDataPath = GetString("zomboidDataPath", _config.ZomboidDataPath);
         if (data.ValueKind == JsonValueKind.Object
+            && data.TryGetProperty("statsIntervalMinutes", out JsonElement intervalEl))
+        {
+            int interval = intervalEl.ValueKind == JsonValueKind.Number && intervalEl.TryGetInt32(out int n)
+                ? n
+                : GetInt("statsIntervalMinutes", _config.StatsIntervalMinutes);
+            _config.StatsIntervalMinutes = StatsHistoryStore.ClampIntervalMinutes(interval);
+        }
+
+        if (data.ValueKind == JsonValueKind.Object
+            && data.TryGetProperty("statsRetentionDays", out JsonElement retentionEl))
+        {
+            int days = retentionEl.ValueKind == JsonValueKind.Number && retentionEl.TryGetInt32(out int d)
+                ? d
+                : GetInt("statsRetentionDays", _config.StatsRetentionDays);
+            _config.StatsRetentionDays = StatsHistoryStore.ClampRetentionDays(days);
+        }
+        if (data.ValueKind == JsonValueKind.Object
             && data.TryGetProperty("uiLanguage", out JsonElement langEl)
             && langEl.ValueKind == JsonValueKind.String)
         {
@@ -1436,7 +1817,9 @@ public partial class MainForm : Form
                 _config.UiLanguage = lang;
         }
 
-        ConfigManager.Save(_config);
+        ConfigManager.SaveImmediately(_config);
+        _statsCollector.ApplyInterval();
+        RefreshHardwareStaticCache();
         SendToWeb("settings_saved", new { success = true });
         SendToWeb("log", "Settings saved.");
         HandleGetSettings();
@@ -1638,7 +2021,8 @@ public partial class MainForm : Form
         }
     }
 
-    private void OnDiscordCustomTimerTick(object? sender, EventArgs e)
+    /// <summary>Driven by <see cref="SchedulerHeartbeat"/>; same due logic as the former 20s Discord timer.</summary>
+    private void TickDiscordCustomHourly()
     {
         DateTime now = DateTime.Now;
         if (now.Minute != 0)
@@ -1759,9 +2143,9 @@ public partial class MainForm : Form
                 "addxp" when !string.IsNullOrWhiteSpace(player) && !string.IsNullOrWhiteSpace(skill) && !string.IsNullOrWhiteSpace(xpAmount) =>
                     $"addxp \"{player}\" {skill} {xpAmount}",
                 "whitelist_add" when !string.IsNullOrWhiteSpace(player) && !string.IsNullOrWhiteSpace(password) =>
-                    $"adduser \"{player}\" \"{password}\"",
+                    $"adduser \"{SanitizeRconToken(player)}\" \"{SanitizeRconToken(password)}\"",
                 "whitelist_remove" when !string.IsNullOrWhiteSpace(player) =>
-                    $"removeuserfromwhitelist \"{player}\"",
+                    $"removeuserfromwhitelist \"{SanitizeRconToken(player)}\"",
                 "servermsg" when !string.IsNullOrWhiteSpace(message) => $"servermsg \"{message}\"",
                 _ => string.Empty
             };
@@ -1788,12 +2172,57 @@ public partial class MainForm : Form
             SendToWeb("server_console", new { line = response });
 
             if (action is "kick" or "ban" or "unban" or "setaccess" or "whitelist_add" or "whitelist_remove")
+            {
                 await HandleGetPlayerListAsync();
+                HandleGetWhitelist();
+            }
         }
         catch (Exception ex)
         {
             SendToWeb("player_action_result", new { success = false, message = ex.Message });
         }
+    }
+
+    private void HandleGetWhitelist()
+    {
+        try
+        {
+            bool? openJoin = WhitelistStore.ReadOpenJoinAllowed(_config);
+            (bool success, string message, List<WhitelistUser> users, string? dbPath) =
+                WhitelistStore.ReadUsers(_config);
+
+            SendToWeb("whitelist_data", new
+            {
+                success,
+                message,
+                dbPath = dbPath ?? "",
+                worldName = WhitelistStore.ResolveWorldName(_config) ?? "",
+                openJoin,
+                users = users.Select(u => new
+                {
+                    username = u.Username,
+                    accessLevel = u.AccessLevel,
+                    steamId = u.SteamId,
+                    banned = u.Banned,
+                    extra = u.Extra
+                })
+            });
+        }
+        catch (Exception ex)
+        {
+            SendToWeb("whitelist_data", new
+            {
+                success = false,
+                message = ex.Message,
+                users = Array.Empty<object>(),
+                openJoin = (bool?)null
+            });
+        }
+    }
+
+    private static string SanitizeRconToken(string value)
+    {
+        return (value ?? "").Replace("\"", "").Replace("\r", "").Replace("\n", "").Trim();
     }
 
     private async Task HandleTestRconConnectionAsync()
@@ -1893,6 +2322,8 @@ public partial class MainForm : Form
             broadcastMessages = BuildBroadcastMessagesPayload(),
             backupSchedule = _backupScheduler.BuildScheduleDto(),
             modUpdateAutoRestart = BuildModUpdateAutoRestartPayload(),
+            statsIntervalMinutes = _config.StatsIntervalMinutes,
+            statsRetentionDays = _config.StatsRetentionDays,
             version = CurrentVersion
         };
 
@@ -2110,6 +2541,21 @@ public partial class MainForm : Form
         }
     }
 
+    private void ClearLogAnalyzeSession()
+    {
+        try
+        {
+            _logAnalyzeCts?.Cancel();
+        }
+        catch
+        {
+            // ignore
+        }
+
+        lock (_logAnalyzeLock)
+            _logSession = null;
+    }
+
     private void HandleReadLog(JsonElement data)
     {
         string path = "";
@@ -2131,6 +2577,248 @@ public partial class MainForm : Form
         });
     }
 
+    private void HandleAnalyzeLog(JsonElement data)
+    {
+        string path = ReadJsonString(data, "path");
+        _logAnalyzeCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _logAnalyzeCts = cts;
+        CancellationToken token = cts.Token;
+        List<ConfiguredModRef> mods = GetConfiguredModRefs();
+
+        SendToWeb("log_analyze_progress", new { path, percent = 0, status = "loading" });
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                LogAnalyzeSession session = LogAnalyzeSession.Load(
+                    path,
+                    _config,
+                    mods,
+                    token,
+                    pct => SendToWeb("log_analyze_progress", new { path, percent = pct, status = "loading" }));
+
+                if (token.IsCancellationRequested)
+                    return;
+
+                lock (_logAnalyzeLock)
+                {
+                    if (token.IsCancellationRequested)
+                        return;
+                    _logSession = session;
+                }
+                SendToWeb("log_analyze_ready", session.Meta());
+            }
+            catch (OperationCanceledException)
+            {
+                // superseded by another analyze
+            }
+            catch (Exception ex)
+            {
+                if (token.IsCancellationRequested)
+                    return;
+                SendToWeb("log_analyze_ready", new
+                {
+                    success = false,
+                    path,
+                    message = ex.Message
+                });
+            }
+        }, token);
+    }
+
+    private void HandleQueryLogEntries(JsonElement data)
+    {
+        LogAnalyzeSession? session;
+        lock (_logAnalyzeLock)
+            session = _logSession;
+        if (session is null)
+        {
+            SendToWeb("log_entries", new { success = false, message = "No log loaded.", rows = Array.Empty<object>(), total = 0 });
+            return;
+        }
+
+        try
+        {
+            string level = ReadJsonString(data, "level");
+            string category = ReadJsonString(data, "category");
+            string search = ReadJsonString(data, "search");
+            string sortBy = ReadJsonString(data, "sortBy", "timestamp");
+            string sortDir = ReadJsonString(data, "sortDir", "asc");
+            int offset = ReadJsonInt(data, "offset", 0);
+            int limit = ReadJsonInt(data, "limit", 150);
+            object page = session.Query(level, category, search, sortBy, sortDir, offset, limit);
+            SendToWeb("log_entries", new
+            {
+                success = true,
+                path = session.FilePath,
+                level,
+                category,
+                search,
+                sortBy,
+                sortDir,
+                page
+            });
+        }
+        catch (Exception ex)
+        {
+            SendToWeb("log_entries", new { success = false, message = ex.Message, rows = Array.Empty<object>(), total = 0 });
+        }
+    }
+
+    private void HandleGetLogContext(JsonElement data)
+    {
+        LogAnalyzeSession? session;
+        lock (_logAnalyzeLock)
+            session = _logSession;
+        if (session is null)
+        {
+            SendToWeb("log_context", new { success = false, message = "No log loaded." });
+            return;
+        }
+
+        int index = ReadJsonInt(data, "index", -1);
+        SendToWeb("log_context", session.GetContext(index));
+    }
+
+    private void HandleGetLogSystemInfo()
+    {
+        LogAnalyzeSession? session;
+        lock (_logAnalyzeLock)
+            session = _logSession;
+        if (session is null)
+        {
+            SendToWeb("log_system_info", new { success = false, message = "No log loaded.", specs = Array.Empty<object>() });
+            return;
+        }
+
+        SendToWeb("log_system_info", session.GetSystemInfo());
+    }
+
+    private void HandleGetLogModInfo()
+    {
+        LogAnalyzeSession? session;
+        lock (_logAnalyzeLock)
+            session = _logSession;
+        if (session is null)
+        {
+            SendToWeb("log_mod_info", new { success = false, message = "No log loaded.", mods = Array.Empty<object>(), overrides = Array.Empty<object>() });
+            return;
+        }
+
+        SendToWeb("log_mod_info", session.GetModInfo());
+    }
+
+    private void BrowseLogFile()
+    {
+        BeginInvoke(new Action(() =>
+        {
+            try
+            {
+                Activate();
+                BringToFront();
+
+                using var dialog = new OpenFileDialog
+                {
+                    Title = "Open log file",
+                    Filter = "Log files (*.txt;*.log)|*.txt;*.log|All files (*.*)|*.*",
+                    CheckFileExists = true,
+                    Multiselect = false
+                };
+
+                string initial = "";
+                if (!string.IsNullOrWhiteSpace(_config.ZomboidDataPath))
+                {
+                    string logs = Path.Combine(_config.ZomboidDataPath, "Logs");
+                    initial = Directory.Exists(logs) ? logs : _config.ZomboidDataPath;
+                }
+                else if (!string.IsNullOrWhiteSpace(_config.ServerPath))
+                {
+                    string logs = Path.Combine(_config.ServerPath, "logs");
+                    initial = Directory.Exists(logs) ? logs : _config.ServerPath;
+                }
+
+                if (!string.IsNullOrWhiteSpace(initial) && Directory.Exists(initial))
+                    dialog.InitialDirectory = initial;
+
+                if (dialog.ShowDialog(this) != DialogResult.OK)
+                    return;
+
+                string full = Path.GetFullPath(dialog.FileName);
+                if (!LogViewer.IsAllowedLogPath(full, _config))
+                {
+                    SendToWeb("log_analyze_ready", new
+                    {
+                        success = false,
+                        path = full,
+                        message = "Path is outside configured log folders."
+                    });
+                    return;
+                }
+
+                SendToWeb("log_file_selected", new { path = full, name = Path.GetFileName(full) });
+                HandleAnalyzeLog(JsonSerializer.SerializeToElement(new { path = full }));
+            }
+            catch (Exception ex)
+            {
+                SendToWeb("log_analyze_ready", new { success = false, message = ex.Message });
+            }
+        }));
+    }
+
+    private List<ConfiguredModRef> GetConfiguredModRefs()
+    {
+        var list = new List<ConfiguredModRef>();
+        try
+        {
+            string? path = _config.LastIniFilePath;
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                return list;
+
+            Dictionary<string, string> raw = IniManager.ReadIni(path);
+            (List<string> workshopIds, List<string> modIds) = IniManager.ParseModLists(raw);
+            int count = Math.Max(workshopIds.Count, modIds.Count);
+            for (int i = 0; i < count; i++)
+            {
+                list.Add(new ConfiguredModRef
+                {
+                    WorkshopId = i < workshopIds.Count ? workshopIds[i] : "",
+                    ModId = i < modIds.Count ? modIds[i] : ""
+                });
+            }
+        }
+        catch
+        {
+            // INI optional for log analysis
+        }
+
+        return list;
+    }
+
+    private static string ReadJsonString(JsonElement data, string name, string fallback = "")
+    {
+        if (data.ValueKind == JsonValueKind.Object
+            && data.TryGetProperty(name, out JsonElement el)
+            && el.ValueKind == JsonValueKind.String)
+        {
+            return el.GetString() ?? fallback;
+        }
+
+        return fallback;
+    }
+
+    private static int ReadJsonInt(JsonElement data, string name, int fallback)
+    {
+        if (data.ValueKind != JsonValueKind.Object || !data.TryGetProperty(name, out JsonElement el))
+            return fallback;
+        if (el.ValueKind == JsonValueKind.Number && el.TryGetInt32(out int n))
+            return n;
+        if (el.ValueKind == JsonValueKind.String && int.TryParse(el.GetString(), out n))
+            return n;
+        return fallback;
+    }
+
     private static string FormatSize(long bytes)
     {
         if (bytes < 1024)
@@ -2142,6 +2830,8 @@ public partial class MainForm : Form
 
     private void StartHardwareMonitor()
     {
+        _hardwareMonitor.EnsureCpuCounter();
+        RefreshHardwareStaticCache();
         _hardwarePollingActive = true;
         if (!_hardwareTimer.Enabled)
             _hardwareTimer.Start();
@@ -2154,30 +2844,77 @@ public partial class MainForm : Form
         _hardwareTimer.Stop();
     }
 
+    /// <summary>
+    /// Refresh rarely-changing hardware UI data (disk totals + INI ports).
+    /// Called when the Server tab opens and when Config/Settings paths change — not per tick.
+    /// </summary>
+    private void RefreshHardwareStaticCache()
+    {
+        try
+        {
+            _hardwareMonitor.RefreshStatic(_config.ServerPath);
+            _cachedHardwarePorts = BuildHardwarePortsCache();
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"RefreshHardwareStaticCache failed: {ex.Message}");
+            _cachedHardwarePorts = new List<object>
+            {
+                new { name = "RCON (settings)", value = _config.RconPort.ToString() }
+            };
+        }
+    }
+
+    private List<object> BuildHardwarePortsCache()
+    {
+        var ports = new List<object>();
+        string iniPath = _config.LastIniFilePath;
+        if (!string.IsNullOrWhiteSpace(iniPath) && File.Exists(iniPath))
+        {
+            Dictionary<string, string> ini = IniManager.ReadIni(iniPath);
+            void AddPort(string key, string label)
+            {
+                if (ini.TryGetValue(key, out string? v) && !string.IsNullOrWhiteSpace(v))
+                    ports.Add(new { name = label, value = v });
+            }
+
+            AddPort("DefaultPort", "DefaultPort");
+            AddPort("UDPPort", "UDPPort");
+            AddPort("SteamPort1", "SteamPort1");
+            AddPort("SteamPort2", "SteamPort2");
+            AddPort("RCONPort", "RCONPort (ini)");
+        }
+
+        ports.Add(new { name = "RCON (settings)", value = _config.RconPort.ToString() });
+        return ports;
+    }
+
     private void PushHardwareStats()
     {
         try
         {
-            object hardware = _hardwareMonitor.Snapshot(_config.ServerPath);
-            var ports = new List<object>();
-            string iniPath = _config.LastIniFilePath;
-            if (!string.IsNullOrWhiteSpace(iniPath) && File.Exists(iniPath))
+            // Dynamic only — ports/static disk come from RefreshHardwareStaticCache.
+            HardwareSnapshot snap = _hardwareMonitor.SampleDynamic(_config.ServerPath);
+            object hardware = new
             {
-                Dictionary<string, string> ini = IniManager.ReadIni(iniPath);
-                void AddPort(string key, string label)
-                {
-                    if (ini.TryGetValue(key, out string? v) && !string.IsNullOrWhiteSpace(v))
-                        ports.Add(new { name = label, value = v });
-                }
+                cpuName = snap.CpuName,
+                cpuUsage = snap.CpuUsage,
+                ramTotalBytes = snap.RamTotalBytes,
+                ramUsedBytes = snap.RamUsedBytes,
+                ramAvailableBytes = snap.RamAvailableBytes,
+                ramTotalGb = snap.RamTotalGb,
+                ramUsedGb = snap.RamUsedGb,
+                diskRoot = snap.DiskRoot,
+                diskTotalBytes = snap.DiskTotalBytes,
+                diskUsedBytes = snap.DiskUsedBytes,
+                diskFreeBytes = snap.DiskFreeBytes,
+                diskTotalGb = snap.DiskTotalGb,
+                diskUsedGb = snap.DiskUsedGb,
+                diskFreeGb = snap.DiskFreeGb
+            };
 
-                AddPort("DefaultPort", "DefaultPort");
-                AddPort("UDPPort", "UDPPort");
-                AddPort("SteamPort1", "SteamPort1");
-                AddPort("SteamPort2", "SteamPort2");
-                AddPort("RCONPort", "RCONPort (ini)");
-            }
-
-            ports.Add(new { name = "RCON (settings)", value = _config.RconPort.ToString() });
+            if (_cachedHardwarePorts.Count == 0)
+                _cachedHardwarePorts = BuildHardwarePortsCache();
 
             string adminsNote =
                 "Access levels are not exposed by the RCON players command. Use Player Management → Set access.";
@@ -2185,7 +2922,7 @@ public partial class MainForm : Form
             SendToWeb("hardware_stats", new
             {
                 hardware,
-                ports,
+                ports = _cachedHardwarePorts,
                 adminsNote,
                 admins = Array.Empty<string>()
             });
@@ -2194,6 +2931,56 @@ public partial class MainForm : Form
         {
             SendToWeb("log", "Hardware stats failed: " + ex.Message);
         }
+    }
+
+    private void HandleGetStatsHistory(JsonElement data)
+    {
+        try
+        {
+            string range = "24h";
+            if (data.ValueKind == JsonValueKind.Object
+                && data.TryGetProperty("range", out JsonElement rangeEl)
+                && rangeEl.ValueKind == JsonValueKind.String)
+            {
+                range = rangeEl.GetString() ?? "24h";
+            }
+
+            StatsDashboard dash = _statsHistory.QueryDashboard(
+                range,
+                _config.StatsIntervalMinutes,
+                _config.StatsRetentionDays);
+            SendToWeb("stats_history", _statsHistory.ToPayload(dash));
+        }
+        catch (Exception ex)
+        {
+            SendToWeb("stats_history", new
+            {
+                range = "24h",
+                sampleCount = 0,
+                samples = Array.Empty<object>(),
+                restarts = Array.Empty<object>(),
+                uptime = new { hasData = false, percent = 0 },
+                error = ex.Message
+            });
+        }
+    }
+
+    private void HandleSaveStatsSettings(JsonElement data)
+    {
+        int interval = ReadJsonInt(data, "intervalMinutes", _config.StatsIntervalMinutes);
+        int retention = ReadJsonInt(data, "retentionDays", _config.StatsRetentionDays);
+        _config.StatsIntervalMinutes = StatsHistoryStore.ClampIntervalMinutes(interval);
+        _config.StatsRetentionDays = StatsHistoryStore.ClampRetentionDays(retention);
+        ConfigManager.Save(_config);
+        _statsCollector.ApplyInterval();
+        SendToWeb("stats_settings_saved", new
+        {
+            success = true,
+            intervalMinutes = _config.StatsIntervalMinutes,
+            retentionDays = _config.StatsRetentionDays
+        });
+        HandleGetStatsHistory(data);
+        HandleGetSettings();
     }
 
     private void HandleSaveBackupSchedule(JsonElement data)
@@ -2475,22 +3262,35 @@ public partial class MainForm : Form
         }
     }
 
-    private async Task HandleGetServerStatusAsync()
+    private static bool ReadIncludePlayersFlag(JsonElement data)
     {
-        bool isOnline = false;
-        Process[] javaProcesses = Process.GetProcessesByName("java");
-        try
+        if (data.ValueKind != JsonValueKind.Object
+            || !data.TryGetProperty("includePlayers", out JsonElement flag))
         {
-            isOnline = javaProcesses.Length > 0;
-        }
-        finally
-        {
-            foreach (Process process in javaProcesses)
-                process.Dispose();
+            // Refresh button / legacy callers: full status.
+            return true;
         }
 
+        return flag.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String => !string.Equals(flag.GetString(), "false", StringComparison.OrdinalIgnoreCase),
+            JsonValueKind.Number => flag.TryGetInt32(out int n) && n != 0,
+            _ => true
+        };
+    }
+
+    /// <param name="includePlayers">
+    /// When true, opens RCON for the players list (Server-tab polling / manual refresh).
+    /// When false, only checks for a Java process — used for background lifecycle pushes.
+    /// </param>
+    private async Task HandleGetServerStatusAsync(bool includePlayers = true)
+    {
+        bool isOnline = IsJavaServerOnline();
+
         string players = "–";
-        if (isOnline && !string.IsNullOrWhiteSpace(_config.RconPassword))
+        if (includePlayers && isOnline && !string.IsNullOrWhiteSpace(_config.RconPassword))
         {
             try
             {
@@ -2868,7 +3668,7 @@ public partial class MainForm : Form
                 _restartInProgress = true;
                 try
                 {
-                    await RunCleanSaveQuitStartAsync(batPath, ct);
+                    await RunCleanSaveQuitStartAsync(batPath, ct, RestartReasons.ModUpdate);
                 }
                 finally
                 {
@@ -2900,10 +3700,40 @@ public partial class MainForm : Form
         return PlayerListParser.Parse(response).Count;
     }
 
+    private async Task<int?> TryGetPlayerCountAsync()
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_config.RconPassword))
+                return null;
+
+            string response = await _rconManager.SendCommandAsync(
+                _config.RconHost,
+                _config.RconPort,
+                _config.RconPassword,
+                "players");
+
+            if (string.IsNullOrWhiteSpace(response)
+                || response.StartsWith("RCON error", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            return PlayerListParser.Parse(response).Count;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     /// <summary>
     /// Shared clean shutdown + start used by scheduled/manual restart and mod-update restart.
     /// </summary>
-    private async Task RunCleanSaveQuitStartAsync(string batPath, CancellationToken ct = default)
+    private async Task RunCleanSaveQuitStartAsync(
+        string batPath,
+        CancellationToken ct = default,
+        string? restartReason = null)
     {
         void Mirror(string text)
         {
@@ -2962,10 +3792,21 @@ public partial class MainForm : Form
         Mirror($"Server started (PID {started.Id}).");
         SendToWeb("server_console", new { line = $"Started embedded process PID {started.Id}" });
         _lastRestartTime = DateTime.Now;
+        if (!string.IsNullOrWhiteSpace(restartReason))
+        {
+            try
+            {
+                _statsHistory.AddRestart(DateTime.UtcNow, restartReason);
+            }
+            catch
+            {
+                // never fail a restart because history logging failed
+            }
+        }
         await HandleGetServerStatusAsync();
     }
 
-    private async Task ExecuteRestartRoutine()
+    private async Task ExecuteRestartRoutine(string reason = RestartReasons.Manual)
     {
         if (_restartInProgress || _modUpdateRestartFlow.IsActive)
         {
@@ -3005,7 +3846,7 @@ public partial class MainForm : Form
             Mirror("Waiting 55 seconds...");
             await Task.Delay(TimeSpan.FromSeconds(55));
 
-            await RunCleanSaveQuitStartAsync(batPath);
+            await RunCleanSaveQuitStartAsync(batPath, restartReason: reason);
 
             IReadOnlyList<string> updatedMods = Array.Empty<string>();
             try
@@ -3048,24 +3889,62 @@ public partial class MainForm : Form
 
     private void SendToWeb(string type, object payload)
     {
-        if (_webView?.CoreWebView2 is null)
-            return;
-
+        // CoreWebView2 must only be touched on the UI thread — never probe it here.
         void Post()
         {
-            var envelope = new
+            try
             {
-                type,
-                payload
-            };
+                if (IsDisposed || _webView?.CoreWebView2 is null)
+                    return;
 
-            string json = JsonSerializer.Serialize(envelope, JsonOptions);
-            _webView.CoreWebView2.PostWebMessageAsJson(json);
+                var envelope = new { type, payload };
+                string json = JsonSerializer.Serialize(envelope, JsonOptions);
+                _webView.CoreWebView2.PostWebMessageAsJson(json);
+            }
+            catch
+            {
+                // ignore UI teardown races
+            }
         }
 
-        if (InvokeRequired)
-            BeginInvoke(Post);
-        else
-            Post();
+        try
+        {
+            if (IsDisposed)
+                return;
+            if (InvokeRequired)
+                BeginInvoke(Post);
+            else
+                Post();
+        }
+        catch
+        {
+            // ignore if handle is gone
+        }
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        try
+        {
+            _hardwareTimer.Stop();
+            _modUpdatePollTimer.Stop();
+            _modUpdateStatusTimer.Stop();
+            _schedulerHeartbeat.Dispose();
+            // Flush any coalesced config.json write before tearing down.
+            ConfigManager.SaveImmediately(_config);
+            _statsCollector.Dispose();
+            _statsHistory.Dispose();
+            _hardwareMonitor.Dispose();
+            ClearLogAnalyzeSession();
+            _rconManager.Dispose();
+            try { _backupCts?.Cancel(); } catch { /* ignore */ }
+            try { _backupCts?.Dispose(); } catch { /* ignore */ }
+        }
+        catch
+        {
+            // ignore shutdown races
+        }
+
+        base.OnFormClosing(e);
     }
 }

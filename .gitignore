@@ -78,6 +78,12 @@ config.json
 **/config.json
 mod_update_state.json
 **/mod_update_state.json
+backup-selftest-result.json
+*.sqlite
+*.db
+
+## Raw screenshot originals (not for GitHub)
+docs/screenshots/_raw/
 
 ## Local test / scratch (personal machine paths, throwaway servers)
 test/

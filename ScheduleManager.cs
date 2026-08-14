@@ -2,29 +2,20 @@ namespace ZomboidManager;
 
 public class ScheduleManager
 {
-    private readonly System.Windows.Forms.Timer _timer;
     private readonly HashSet<int> _selectedHours = new();
     private int? _lastTriggeredHour;
     private bool _announce10Min;
     private bool _announce5Min;
     private string? _last10AnnounceKey;
     private string? _last5AnnounceKey;
+    private bool _active;
 
     public event Action<int>? RestartTriggered;
     /// <summary>Fired with minutes-before (10 or 5) when a pre-restart announcement should be sent.</summary>
     public event Action<int>? WarningAnnouncementTriggered;
     public event Action<string>? LogMessage;
 
-    public bool IsRunning => _timer.Enabled;
-
-    public ScheduleManager()
-    {
-        _timer = new System.Windows.Forms.Timer
-        {
-            Interval = 20000
-        };
-        _timer.Tick += OnTimerTick;
-    }
+    public bool IsRunning => _active;
 
     public void UpdateSelectedHours(IEnumerable<int> hours)
     {
@@ -44,18 +35,22 @@ public class ScheduleManager
 
     public void Start()
     {
-        _timer.Start();
+        _active = true;
         LogMessage?.Invoke("Scheduler started.");
     }
 
     public void Stop()
     {
-        _timer.Stop();
+        _active = false;
         LogMessage?.Invoke("Scheduler stopped.");
     }
 
-    private void OnTimerTick(object? sender, EventArgs e)
+    /// <summary>Invoked by <see cref="SchedulerHeartbeat"/>; no-op while the restart scheduler is off.</summary>
+    public void Tick()
     {
+        if (!_active)
+            return;
+
         DateTime now = DateTime.Now;
 
         CheckPreRestartAnnouncements(now);

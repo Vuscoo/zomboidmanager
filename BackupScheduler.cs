@@ -1,8 +1,7 @@
 namespace ZomboidManager;
 
-public sealed class BackupScheduler : IDisposable
+public sealed class BackupScheduler
 {
-    private readonly System.Windows.Forms.Timer _timer;
     private BackupScheduleConfig _schedule = new();
     private string? _lastFiredKey;
     private bool _tickBusy;
@@ -10,22 +9,7 @@ public sealed class BackupScheduler : IDisposable
     public event Action? BackupDue;
     public event Action? ScheduleDisabled;
 
-    public BackupScheduler()
-    {
-        _timer = new System.Windows.Forms.Timer { Interval = 20000 };
-        _timer.Tick += OnTick;
-    }
-
     public BackupScheduleConfig Schedule => _schedule;
-
-    public void Start() => _timer.Start();
-    public void Stop() => _timer.Stop();
-
-    public void Dispose()
-    {
-        _timer.Stop();
-        _timer.Dispose();
-    }
 
     public void UpdateSchedule(BackupScheduleConfig? schedule)
     {
@@ -110,7 +94,8 @@ public sealed class BackupScheduler : IDisposable
         ScheduleDisabled?.Invoke();
     }
 
-    private void OnTick(object? sender, EventArgs e)
+    /// <summary>Invoked by <see cref="SchedulerHeartbeat"/>; cheap no-op when disabled.</summary>
+    public void Tick()
     {
         if (_tickBusy || !_schedule.Enabled)
             return;

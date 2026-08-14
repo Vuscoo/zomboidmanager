@@ -52,11 +52,13 @@ public static class LogViewer
             }
         }
 
-        // Zomboid user data: ...\Zomboid\Logs
+        // Zomboid user data: ...\Zomboid\Logs plus console.txt at the data root
         if (!string.IsNullOrWhiteSpace(config.ZomboidDataPath))
         {
             AddFromFolder(Path.Combine(config.ZomboidDataPath, "Logs"), "Zomboid Logs");
             AddFromFolder(Path.Combine(config.ZomboidDataPath, "logs"), "Zomboid Logs");
+            TryAdd(Path.Combine(config.ZomboidDataPath, "console.txt"), "Zomboid Logs", seen, results);
+            TryAdd(Path.Combine(config.ZomboidDataPath, "server-console.txt"), "Zomboid Logs", seen, results);
         }
 
         // Dedicated server install: ...\pzServer\logs
@@ -121,30 +123,78 @@ public static class LogViewer
             name.Contains(part, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static bool IsUnderAllowedRoot(string fullPath, AppConfig config)
+    public static bool IsConsoleLogFile(string path)
+    {
+        string name = Path.GetFileName(path);
+        return name.Equals("console.txt", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("server-console.txt", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsAllowedLogPath(string fullPath, AppConfig config)
+    {
+        if (IsUnderAllowedRoot(fullPath, config))
+            return true;
+
+        if (!IsConsoleLogFile(fullPath) || string.IsNullOrWhiteSpace(config.ZomboidDataPath))
+            return false;
+
+        try
+        {
+            string dataRoot = Path.GetFullPath(config.ZomboidDataPath)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string dir = Path.GetDirectoryName(fullPath) ?? "";
+            return string.Equals(Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                dataRoot, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static string FormatSize(long bytes)
+    {
+        if (bytes < 1024)
+            return $"{bytes} B";
+        if (bytes < 1024 * 1024)
+            return $"{bytes / 1024.0:0.#} KB";
+        return $"{bytes / (1024.0 * 1024.0):0.#} MB";
+    }
+
+    public static bool IsUnderAllowedRoot(string fullPath, AppConfig config)
     {
         var roots = new List<string>();
         if (!string.IsNullOrWhiteSpace(config.ZomboidDataPath))
         {
-            roots.Add(Path.Combine(config.ZomboidDataPath, "Logs"));
-            roots.Add(Path.Combine(config.ZomboidDataPath, "logs"));
+            roots.Add(Path.Combine(config.ZomboidDataPath.Trim(), "Logs"));
+            roots.Add(Path.Combine(config.ZomboidDataPath.Trim(), "logs"));
         }
         if (!string.IsNullOrWhiteSpace(config.ServerPath))
         {
-            roots.Add(Path.Combine(config.ServerPath, "logs"));
-            roots.Add(Path.Combine(config.ServerPath, "Logs"));
+            roots.Add(Path.Combine(config.ServerPath.Trim(), "logs"));
+            roots.Add(Path.Combine(config.ServerPath.Trim(), "Logs"));
         }
 
-        foreach (string root in roots)
+        string normalizedFile;
+        try
+        {
+            normalizedFile = Path.GetFullPath(fullPath);
+        }
+        catch
+        {
+            return false;
+        }
+
+        foreach (string root in roots.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             try
             {
-                if (!Directory.Exists(root))
-                    continue;
+                // Do not require Directory.Exists — the file may live in a root that
+                // was listed moments ago; Exists can race with case-aliases on Windows.
                 string rootFull = Path.GetFullPath(root)
                     .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
                     + Path.DirectorySeparatorChar;
-                if (fullPath.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
+                if (normalizedFile.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
                     return true;
             }
             catch
@@ -158,7 +208,9 @@ public static class LogViewer
 
     private static void TryAdd(string file, string source, HashSet<string> seen, List<LogFileInfo> results)
     {
-        if (!IsImportantLogFile(file))
+        if (!File.Exists(file))
+            return;
+        if (!IsImportantLogFile(file) && !IsConsoleLogFile(file))
             return;
 
         string full = Path.GetFullPath(file);
