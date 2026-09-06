@@ -156,7 +156,7 @@ Personal hobby project, built with AI-assisted development (Cursor). Functional 
 
 ## License / disclaimer
 
-License: *TBD* (to be decided separately).
+Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Vusco.
 
 Not affiliated with The Indie Stone. Project Zomboid is © The Indie Stone.  
-Use at your own risk  -  always keep world backups.
+Use at your own risk — always keep world backups.
