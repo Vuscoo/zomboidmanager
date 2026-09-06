@@ -50,6 +50,22 @@ static class Program
             return;
         }
 
+        if (args.Any(a => string.Equals(a, "--selftest-mod-mappings", StringComparison.OrdinalIgnoreCase)))
+        {
+            ManualModMappingHelper.RunSelfTest();
+            return;
+        }
+
+        if (args.Any(a => string.Equals(a, "--selftest-sandbox-tables", StringComparison.OrdinalIgnoreCase)))
+        {
+            string? sandboxArg = args.SkipWhile(a =>
+                    !string.Equals(a, "--selftest-sandbox-tables", StringComparison.OrdinalIgnoreCase))
+                .Skip(1)
+                .FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal));
+            SandboxManagerSelfTest.Run(sandboxArg);
+            return;
+        }
+
         // UI text is English; keep German culture for dates, times, and numbers.
         var de = CultureInfo.GetCultureInfo("de-DE");
         CultureInfo.DefaultThreadCurrentCulture = de;

@@ -76,11 +76,26 @@ artifacts/
 # Real runtime config only — config.example.json is the public template and must be committed.
 config.json
 **/config.json
+config.json.broken.*
 mod_update_state.json
 **/mod_update_state.json
 backup-selftest-result.json
+mod_update_selftest.json
+mod_update_restart_selftest.json
+selftest-*.txt
 *.sqlite
 *.db
+
+## Project Zomboid user/server data (never commit savegames / worlds / logs)
+**/Zomboid/
+**/Zomboid/**
+**/Multiplayer/
+**/Saves/
+**/Sandbox Presets/
+**/servertest.ini
+**/servertest_SandboxVars.lua
+**/servertest_SandboxVars.lua.*
+**/*_SandboxVars.lua.pre-repair.bak
 
 ## Raw screenshot originals (not for GitHub)
 docs/screenshots/_raw/

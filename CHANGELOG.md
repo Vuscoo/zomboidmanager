@@ -1,5 +1,41 @@
 # Changelog
 
+## v1.1.0
+
+### New
+- **Server update (SteamCMD)** — update the Project Zomboid dedicated server from a new Tools tile; checks Steam first and skips the download when already up to date
+- **Steam branch setting** — choose B42 Stable (`public`, default), Build 41 (`legacy41`), or legacy B42 beta (`42.19`) under Settings → Paths
+- **SteamCMD path** — configure where SteamCMD lives under Settings → Paths
+- **Manual Mod Mapping** — optional mapping when one Workshop item contains several Mod IDs: define a friendly name and group them in the mod list; mod-update notifications (including Discord) use that name and the full Mod ID list instead of a single guessed entry
+- **Bilingual UI (English & German only)** — all user-visible text in the web UI and backend logs/toasts follows the language chosen in Settings; French, Spanish, and other partial translations were removed to keep EN/DE complete
+- **Startup update check** — after launch, prompts Yes/No when a newer app version is available on GitHub (same update path as Help → Update)
+- **Discord message style** — server/restart/mod-update notifications use a simple single-line format (`emoji **Game Server** – …`)
+
+### Improved
+- **Update pre-check** — compares against the correct Steam branch (B42 Stable uses `public`, not the old `42.19` beta) so false “update available” prompts are avoided
+- **Installed version detection** — reads game version from recent server logs only (ignores stale log lines older than the installed `projectzomboid.jar`)
+- **Cleaner update console** — SteamCMD noise is filtered; progress appears as compact percentage lines
+- **Update flow** — server is not stopped until an update is actually needed; confirmation dialog before download
+- **UI cleanup** — removed unused Network & Access “Server admins” block and redundant tip/hint texts (Config, Settings, Restart Warnings)
+- **Mod Update Auto-Restart** — more compact card; warn minutes and restart delay share one value; cancel sends a Discord skip notice
+- **Discord restart message** — “Server is restarting” notes that load can take up to 10 minutes
+- **Server tab dashboard** — status/players cards, live CPU/memory/disk meters, cleaner console; orange “Server is starting” until the server is fully up
+
+### Fixed
+- **SandboxVars.lua** — settings stored as Lua tables (common with mod option blocks) no longer show only `{` in the Config editor; they appear as readable multi-line text and are saved back without corrupting the file
+- **Wrong update target** — server update no longer pointed at the `42.19` unstable branch when B42 Stable (`42.20.x`) was intended
+- **Mixed-language UI** — hardcoded German backend strings and untranslated UI fragments replaced with centralized localization (`AppLocalizer` + `i18n.js`)
+- **Discord “server online”** — sent only after `SERVER STARTED` in the log, not when the process launches
+- **Server Online status** — UI (and sidebar) show Online only after `SERVER STARTED`, same as Discord
+- **Stop/kill safety** — only Project Zomboid Java processes are terminated (command line / path fingerprint); other Java apps are left alone
+- **Close while server running** — confirmation dialog: stop & close, leave running in background, or cancel
+- **Broken config.json** — damaged settings are backed up as `config.json.broken.<timestamp>` with a clear warning instead of a silent reset
+- **Wait-for-empty warnings** — chat warning no longer promises a fixed “in X minutes” countdown when waiting for an empty server
+- **Orphan console cleanup** — only manager-launched or fingerprint-matched StartServer consoles are closed
+- **Scheduled restart while offline** — skipped with a clear log line instead of a pointless RCON failure
+- **Start/Stop races** — rapid Start/Stop/Restart and mod-update flows no longer overlap; stale process-exit events cannot clear a newer boot watch
+- **Warn-minutes `0`** — value `0` is preserved in the UI (no longer forced back to `5`)
+
 ## v1.0.9 — Big Update
 
 This release adds four major tools — **Log Analyzer**, **Config Profiles**, **Whitelist Manager**, and a **Statistics** dashboard — and makes the app feel faster and lighter in daily use: quicker backups, smoother Server-tab updates, faster startup, and less background work when you are not looking at a feature.
@@ -67,8 +103,6 @@ Everyday use should feel lighter — especially with the Server tab open, during
 - Settings are written to disk in short batches when many small changes happen quickly; a full **Save settings** and closing the app still write immediately
 - The app postpones non-essential background work until the UI is ready, and Tools panels wire themselves the first time you open them — so the main window becomes usable sooner
 - CPU usage metering starts when you first open the Server tab, not at launch
-
-More features for this version will be added below as they land.
 
 ## v1.0.8
 

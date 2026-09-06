@@ -27,6 +27,8 @@ public static class ModUpdateChecker
         Timeout = TimeSpan.FromSeconds(20)
     };
 
+    private static readonly SemaphoreSlim CheckGate = new(1, 1);
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -41,7 +43,8 @@ public static class ModUpdateChecker
     /// </summary>
     public static async Task<IReadOnlyList<string>> CheckForUpdatedModsAsync(
         IEnumerable<string> workshopIds,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        Func<string, string?, string>? formatLabel = null)
     {
         List<string> ids = workshopIds
             .Select(id => (id ?? string.Empty).Trim())
@@ -52,6 +55,22 @@ public static class ModUpdateChecker
         if (ids.Count == 0)
             return Array.Empty<string>();
 
+        await CheckGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            return await CheckForUpdatedModsCoreAsync(ids, log, formatLabel).ConfigureAwait(false);
+        }
+        finally
+        {
+            CheckGate.Release();
+        }
+    }
+
+    private static async Task<IReadOnlyList<string>> CheckForUpdatedModsCoreAsync(
+        List<string> ids,
+        Action<string>? log,
+        Func<string, string?, string>? formatLabel)
+    {
         Dictionary<string, long> previous = LoadState();
         List<WorkshopFileDetails> details;
         try
@@ -81,7 +100,10 @@ public static class ModUpdateChecker
             string id = detail.PublishedFileId.Trim();
             if (previous.TryGetValue(id, out long oldUpdated) && detail.TimeUpdated > oldUpdated)
             {
-                string label = string.IsNullOrWhiteSpace(detail.Title) ? id : detail.Title.Trim();
+                string steamTitle = string.IsNullOrWhiteSpace(detail.Title) ? id : detail.Title.Trim();
+                string label = formatLabel?.Invoke(id, steamTitle) ?? steamTitle;
+                if (string.IsNullOrWhiteSpace(label))
+                    label = steamTitle;
                 updatedNames.Add(label);
             }
 

@@ -36,13 +36,13 @@ public class ScheduleManager
     public void Start()
     {
         _active = true;
-        LogMessage?.Invoke("Scheduler started.");
+        LogMessage?.Invoke("scheduler.started");
     }
 
     public void Stop()
     {
         _active = false;
-        LogMessage?.Invoke("Scheduler stopped.");
+        LogMessage?.Invoke("scheduler.stopped");
     }
 
     /// <summary>Invoked by <see cref="SchedulerHeartbeat"/>; no-op while the restart scheduler is off.</summary>
@@ -70,7 +70,7 @@ public class ScheduleManager
 
         _lastTriggeredHour = hour;
         RestartTriggered?.Invoke(hour);
-        LogMessage?.Invoke($"Restart triggered for hour {hour:00}:00.");
+        LogMessage?.Invoke($"scheduler.restartHour|{hour}");
     }
 
     private void CheckPreRestartAnnouncements(DateTime now)
@@ -107,7 +107,6 @@ public class ScheduleManager
         }
 
         WarningAnnouncementTriggered?.Invoke(minutesBefore);
-        LogMessage?.Invoke(
-            $"Pre-restart announcement ({minutesBefore} min) for upcoming restart at {targetHour:00}:00.");
+        LogMessage?.Invoke($"scheduler.preAnnounce|{minutesBefore}|{targetHour}");
     }
 }

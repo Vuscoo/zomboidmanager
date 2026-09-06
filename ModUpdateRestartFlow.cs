@@ -84,6 +84,22 @@ public sealed class ModUpdateRestartFlow
         return true;
     }
 
+    /// <summary>
+    /// Called from the shared clean-restart path right before StartServer so the UI can show
+    /// "Starting…" until the flow completes (SERVER STARTED watch is armed separately).
+    /// </summary>
+    public void NotifyEnteringStartPhase()
+    {
+        lock (_gate)
+        {
+            if (_phase != ModUpdateRestartPhase.ShuttingDown)
+                return;
+            SetPhase_NoLock(ModUpdateRestartPhase.Starting, "Starting server…");
+        }
+
+        RaiseStatusChanged();
+    }
+
     public object BuildStatusPayload()
     {
         lock (_gate)
@@ -165,10 +181,30 @@ public sealed class ModUpdateRestartFlow
             if (minutesForMessage < 0)
                 minutesForMessage = 0;
 
-            string warning = _warningTemplate.Replace(
-                "{minutes}",
-                minutesForMessage.ToString(),
-                StringComparison.OrdinalIgnoreCase);
+            bool useEmptyWait = !skipCountdown && _waitForEmpty && countdownOverride is null;
+
+            string warning;
+            if (useEmptyWait)
+            {
+                // Avoid promising a fixed "in X minutes" countdown while waiting for empty.
+                if (!string.IsNullOrWhiteSpace(_warningTemplate)
+                    && !_warningTemplate.Contains("{minutes}", StringComparison.OrdinalIgnoreCase))
+                {
+                    warning = _warningTemplate;
+                }
+                else
+                {
+                    warning =
+                        $"A mod has been updated. The server will restart when empty (at latest in {_maxWaitMinutes} minutes).";
+                }
+            }
+            else
+            {
+                warning = _warningTemplate.Replace(
+                    "{minutes}",
+                    minutesForMessage.ToString(),
+                    StringComparison.OrdinalIgnoreCase);
+            }
 
             log("Mod-update restart: sending warning to players.");
             string warnCmd = BroadcastRconCommand.FormatOutgoingMessage(warning);
@@ -179,7 +215,6 @@ public sealed class ModUpdateRestartFlow
                 return;
             }
 
-            bool useEmptyWait = !skipCountdown && _waitForEmpty && countdownOverride is null;
             if (useEmptyWait)
             {
                 lock (_gate)

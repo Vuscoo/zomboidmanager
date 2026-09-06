@@ -27,6 +27,9 @@ public sealed class RconManager : IDisposable
         if (!IPAddress.TryParse(host, out IPAddress? ipAddress))
             return $"RCON error: Invalid host address '{host}'.";
 
+        if (port is < 1 or > 65535)
+            return $"RCON error: Invalid port '{port}' (expected 1–65535).";
+
         await _gate.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -159,7 +162,15 @@ public sealed class RconManager : IDisposable
         if (DateTime.UtcNow - _lastUsedUtc < IdleTimeout - TimeSpan.FromMilliseconds(250))
             return;
 
-        await _gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await _gate.WaitAsync().ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
         try
         {
             if (_disposed)
@@ -170,7 +181,7 @@ public sealed class RconManager : IDisposable
         }
         finally
         {
-            _gate.Release();
+            try { _gate.Release(); } catch (ObjectDisposedException) { /* shutting down */ }
         }
     }
 

@@ -6,6 +6,9 @@ public class AppConfig
 {
     public List<int> SelectedHours { get; set; } = new();
     public string ServerPath { get; set; } = string.Empty;
+    public string SteamCmdPath { get; set; } = "C:\\steamcmd\\steamcmd.exe";
+    /// <summary>Steam beta branch for app_update. Empty or "public" = B42 Stable (default since 42.20).</summary>
+    public string SteamUpdateBranch { get; set; } = string.Empty;
     public string StartBat { get; set; } = string.Empty;
     public string RconHost { get; set; } = "127.0.0.1";
     public int RconPort { get; set; } = 27015;
@@ -18,7 +21,7 @@ public class AppConfig
     public string ZomboidUserPath { get; set; } = string.Empty;
     public string ZomboidDataPath { get; set; } = string.Empty;
     public string LastIniFilePath { get; set; } = string.Empty;
-    /// <summary>UI language code, e.g. de, en, fr. Empty = not chosen yet.</summary>
+    /// <summary>UI language: de or en. Empty = not chosen yet (first-run modal).</summary>
     public string UiLanguage { get; set; } = string.Empty;
 
     public string DiscordWebhookUrl { get; set; } = string.Empty;
@@ -36,11 +39,23 @@ public class AppConfig
 
     public ModUpdateAutoRestartConfig ModUpdateAutoRestart { get; set; } = new();
 
+    /// <summary>
+    /// Optional Workshop ID → multiple Mod IDs (plus display name) for packs that are not 1:1.
+    /// </summary>
+    public List<ManualModMapping> ManualModMappings { get; set; } = new();
+
     /// <summary>Minutes between historical stats samples while the server is running (1–5).</summary>
     public int StatsIntervalMinutes { get; set; } = 2;
 
     /// <summary>Days of stats/restart history to keep (default 30).</summary>
     public int StatsRetentionDays { get; set; } = 30;
+}
+
+public class ManualModMapping
+{
+    public string WorkshopId { get; set; } = string.Empty;
+    public List<string> ModIds { get; set; } = new();
+    public string DisplayName { get; set; } = string.Empty;
 }
 
 public class ModUpdateAutoRestartConfig
@@ -107,21 +122,70 @@ public static class ConfigManager
     private static AppConfig? _pendingConfig;
     private static System.Threading.Timer? _debounceTimer;
 
-    public static AppConfig Load()
+    /// <summary>
+    /// Loads config from disk. On parse/IO failure, backs up the broken file and returns defaults
+    /// plus backup path / error detail for a user-visible warning.
+    /// </summary>
+    public static (AppConfig Config, string? BrokenBackupPath, string? ErrorDetail) LoadWithStatus()
     {
         try
         {
             MigrateLegacyConfigIfNeeded();
 
             if (!File.Exists(ConfigPath))
-                return new AppConfig();
+                return (new AppConfig(), null, null);
 
             string json = File.ReadAllText(ConfigPath);
-            return JsonSerializer.Deserialize<AppConfig>(json) ?? new AppConfig();
+            var config = JsonSerializer.Deserialize<AppConfig>(json);
+            if (config is null)
+            {
+                string? backup = TryBackupBrokenConfig("deserialize returned null");
+                return (new AppConfig(), backup, "deserialize returned null");
+            }
+
+            NormalizeUiLanguage(config);
+            return (config, null, null);
+        }
+        catch (Exception ex)
+        {
+            string? backup = TryBackupBrokenConfig(ex.Message);
+            return (new AppConfig(), backup, ex.Message);
+        }
+    }
+
+    public static AppConfig Load()
+    {
+        var (config, _, _) = LoadWithStatus();
+        return config;
+    }
+
+    private static string? TryBackupBrokenConfig(string reason)
+    {
+        try
+        {
+            if (!File.Exists(ConfigPath))
+                return null;
+
+            Directory.CreateDirectory(ConfigDirectory);
+            string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            string backupPath = Path.Combine(ConfigDirectory, $"config.json.broken.{stamp}");
+            File.Copy(ConfigPath, backupPath, overwrite: false);
+            try
+            {
+                File.AppendAllText(
+                    backupPath + ".reason.txt",
+                    DateTime.Now.ToString("o") + " — " + reason + Environment.NewLine);
+            }
+            catch
+            {
+                // backup of the json is enough
+            }
+
+            return backupPath;
         }
         catch
         {
-            return new AppConfig();
+            return null;
         }
     }
 
@@ -186,6 +250,18 @@ public static class ConfigManager
             WriteToDisk(config);
     }
 
+    /// <summary>Disposes the debounced save timer after a final flush/save on shutdown.</summary>
+    public static void DisposeDebounceTimer()
+    {
+        lock (Sync)
+        {
+            _pendingConfig = null;
+            _debounceTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+            _debounceTimer?.Dispose();
+            _debounceTimer = null;
+        }
+    }
+
     private static void WriteToDisk(AppConfig config)
     {
         lock (Sync)
@@ -194,6 +270,17 @@ public static class ConfigManager
             string json = JsonSerializer.Serialize(config, JsonOptions);
             File.WriteAllText(ConfigPath, json);
         }
+    }
+
+    private static void NormalizeUiLanguage(AppConfig config)
+    {
+        if (config.UiLanguage == "de")
+            return;
+
+        if (string.IsNullOrWhiteSpace(config.UiLanguage))
+            return;
+
+        config.UiLanguage = "en";
     }
 
     private static void MigrateLegacyConfigIfNeeded()

@@ -6,6 +6,11 @@ namespace ZomboidManager;
 
 public static class SandboxManager
 {
+    private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
+
+    /// <summary>
+    /// Top-level (or any single-line) assignment: key = value, with optional trailing comma.
+    /// </summary>
     private static readonly Regex AssignmentRegex = new(
         @"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*,?\s*$",
         RegexOptions.Compiled);
@@ -53,25 +58,51 @@ public static class SandboxManager
         if (!File.Exists(filePath))
             throw new FileNotFoundException("SandboxVars file not found.", filePath);
 
-        foreach (string rawLine in File.ReadAllLines(filePath))
+        string[] lines = File.ReadAllLines(filePath);
+        int depth = 0;
+        int i = 0;
+
+        while (i < lines.Length)
         {
-            string line = rawLine.Trim();
-            if (string.IsNullOrWhiteSpace(line) || line.StartsWith("--") || line.StartsWith("SandboxVars")
-                || line == "{" || line == "}" || line.StartsWith("return", StringComparison.OrdinalIgnoreCase))
+            string rawLine = lines[i];
+            string trimmed = rawLine.Trim();
+            int depthBefore = depth;
+
+            // Only parse assignments directly under SandboxVars = { ... } (depth 1).
+            if (depthBefore == 1
+                && !string.IsNullOrWhiteSpace(trimmed)
+                && !trimmed.StartsWith("--", StringComparison.Ordinal)
+                && !trimmed.StartsWith("return", StringComparison.OrdinalIgnoreCase))
             {
-                continue;
+                Match match = AssignmentRegex.Match(trimmed);
+                if (match.Success)
+                {
+                    string key = match.Groups[1].Value.Trim();
+                    string rhs = match.Groups[2].Value.Trim().TrimEnd(',').Trim();
+
+                    if (!string.Equals(key, "VERSION", StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(key, "SandboxVars", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (rhs.StartsWith('{'))
+                        {
+                            if (!TryExtractTable(lines, i, out string tableText, out int endIndex))
+                                throw new InvalidDataException(
+                                    $"Unbalanced Lua table for '{key}' starting at line {i + 1}.");
+
+                            result[key] = tableText;
+                            for (int j = i; j <= endIndex; j++)
+                                depth += NetBraceDelta(lines[j]);
+                            i = endIndex + 1;
+                            continue;
+                        }
+
+                        result[key] = NormalizeLuaValue(rhs);
+                    }
+                }
             }
 
-            Match match = AssignmentRegex.Match(line);
-            if (!match.Success)
-                continue;
-
-            string key = match.Groups[1].Value.Trim();
-            string value = match.Groups[2].Value.Trim().TrimEnd(',');
-            if (string.Equals(key, "VERSION", StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            result[key] = NormalizeLuaValue(value);
+            depth += NetBraceDelta(rawLine);
+            i++;
         }
 
         return result;
@@ -85,32 +116,82 @@ public static class SandboxManager
 
         string[] lines = File.ReadAllLines(filePath);
         var remaining = new Dictionary<string, string>(values, StringComparer.OrdinalIgnoreCase);
-        var output = new List<string>();
+        var output = new List<string>(lines.Length + remaining.Count);
 
-        foreach (string rawLine in lines)
+        int depth = 0;
+        int i = 0;
+
+        while (i < lines.Length)
         {
+            string rawLine = lines[i];
             string trimmed = rawLine.Trim();
-            Match match = AssignmentRegex.Match(trimmed);
-            if (!match.Success)
+            int depthBefore = depth;
+
+            if (depthBefore == 1
+                && !string.IsNullOrWhiteSpace(trimmed)
+                && !trimmed.StartsWith("--", StringComparison.Ordinal))
             {
-                output.Add(rawLine);
-                continue;
+                Match match = AssignmentRegex.Match(trimmed);
+                if (match.Success)
+                {
+                    string key = match.Groups[1].Value.Trim();
+                    string rhs = match.Groups[2].Value.Trim().TrimEnd(',').Trim();
+
+                    if (remaining.TryGetValue(key, out string? newValue))
+                    {
+                        string indent = rawLine[..(rawLine.Length - rawLine.TrimStart().Length)];
+                        bool originalWasTable = rhs.StartsWith('{');
+
+                        if (originalWasTable)
+                        {
+                            if (!TryExtractTable(lines, i, out _, out int endIndex))
+                                throw new InvalidDataException(
+                                    $"Unbalanced Lua table for '{key}' starting at line {i + 1}.");
+
+                            bool hasComma = LineHasTrailingCommaAfterTable(lines, i, endIndex);
+                            AppendAssignment(output, indent, key, newValue, hasComma);
+
+                            for (int j = i; j <= endIndex; j++)
+                                depth += NetBraceDelta(lines[j]);
+                            remaining.Remove(key);
+                            i = endIndex + 1;
+                            continue;
+                        }
+
+                        // Scalar (or user replaced a scalar with a table).
+                        bool hasCommaScalar = trimmed.EndsWith(',');
+                        AppendAssignment(output, indent, key, newValue, hasCommaScalar);
+                        depth += NetBraceDelta(rawLine);
+                        remaining.Remove(key);
+                        i++;
+                        continue;
+                    }
+
+                    // Key not in save payload: if it is a table, keep the whole block untouched.
+                    if (rhs.StartsWith('{'))
+                    {
+                        if (!TryExtractTable(lines, i, out _, out int endIndex))
+                            throw new InvalidDataException(
+                                $"Unbalanced Lua table for '{key}' starting at line {i + 1}.");
+
+                        for (int j = i; j <= endIndex; j++)
+                        {
+                            output.Add(lines[j]);
+                            depth += NetBraceDelta(lines[j]);
+                        }
+
+                        i = endIndex + 1;
+                        continue;
+                    }
+                }
             }
 
-            string key = match.Groups[1].Value.Trim();
-            if (!remaining.TryGetValue(key, out string? newValue))
-            {
-                output.Add(rawLine);
-                continue;
-            }
-
-            string indent = rawLine[..^rawLine.TrimStart().Length];
-            bool hasComma = trimmed.EndsWith(',');
-            output.Add($"{indent}{key} = {ToLuaLiteral(newValue)}{(hasComma ? "," : string.Empty)}");
-            remaining.Remove(key);
+            output.Add(rawLine);
+            depth += NetBraceDelta(rawLine);
+            i++;
         }
 
-        // Append unknown new keys before the closing brace if possible.
+        // Append unknown new keys before the closing root brace if possible.
         if (remaining.Count > 0)
         {
             int closeIndex = output.FindLastIndex(l => l.Trim() == "}");
@@ -118,13 +199,13 @@ public static class SandboxManager
             {
                 foreach (KeyValuePair<string, string> pair in remaining)
                 {
-                    output.Insert(closeIndex, $"    {pair.Key} = {ToLuaLiteral(pair.Value)},");
+                    AppendAssignment(output, "    ", pair.Key, pair.Value, trailingComma: true, insertAt: closeIndex);
                     closeIndex++;
                 }
             }
         }
 
-        File.WriteAllLines(filePath, output, Encoding.UTF8);
+        File.WriteAllText(filePath, string.Join(Environment.NewLine, output) + Environment.NewLine, Utf8NoBom);
     }
 
     public static List<IniEntry> ParseToEntries(Dictionary<string, string> raw)
@@ -136,7 +217,11 @@ public static class SandboxManager
             string category = meta.Category;
             string inputType = meta.InputType;
 
-            if (string.Equals(pair.Value, "true", StringComparison.OrdinalIgnoreCase)
+            if (IsLuaTableLiteral(pair.Value))
+            {
+                inputType = "lua_table";
+            }
+            else if (string.Equals(pair.Value, "true", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(pair.Value, "false", StringComparison.OrdinalIgnoreCase))
             {
                 inputType = "checkbox";
@@ -165,6 +250,131 @@ public static class SandboxManager
             .ToList();
     }
 
+    public static bool IsLuaTableLiteral(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+        string trimmed = value.Trim();
+        return trimmed.StartsWith('{') && trimmed.EndsWith('}');
+    }
+
+    /// <summary>
+    /// Extracts a balanced Lua table starting at the first '{' on <paramref name="startIndex"/>.
+    /// Returns the exact table text from '{' through the matching '}'.
+    /// </summary>
+    public static bool TryExtractTable(string[] lines, int startIndex, out string tableText, out int endIndex)
+    {
+        tableText = string.Empty;
+        endIndex = startIndex;
+
+        if (startIndex < 0 || startIndex >= lines.Length)
+            return false;
+
+        int braceStart = lines[startIndex].IndexOf('{');
+        if (braceStart < 0)
+            return false;
+
+        var sb = new StringBuilder();
+        int depth = 0;
+        bool inSingle = false;
+        bool inDouble = false;
+
+        for (int lineIdx = startIndex; lineIdx < lines.Length; lineIdx++)
+        {
+            string line = lines[lineIdx];
+            int charStart = lineIdx == startIndex ? braceStart : 0;
+
+            for (int c = charStart; c < line.Length; c++)
+            {
+                char ch = line[c];
+                char prev = c > 0 ? line[c - 1] : '\0';
+
+                // Line comments outside strings — stop counting braces for the rest of the line,
+                // but still include comment text in the captured table body.
+                if (!inSingle && !inDouble && ch == '-' && c + 1 < line.Length && line[c + 1] == '-')
+                {
+                    sb.Append(line.AsSpan(c));
+                    break;
+                }
+
+                if (!inDouble && ch == '\'' && prev != '\\')
+                    inSingle = !inSingle;
+                else if (!inSingle && ch == '"' && prev != '\\')
+                    inDouble = !inDouble;
+                else if (!inSingle && !inDouble)
+                {
+                    if (ch == '{')
+                        depth++;
+                    else if (ch == '}')
+                        depth--;
+                }
+
+                sb.Append(ch);
+
+                if (depth == 0)
+                {
+                    tableText = sb.ToString();
+                    endIndex = lineIdx;
+                    return true;
+                }
+            }
+
+            if (lineIdx < lines.Length - 1)
+                sb.Append('\n');
+        }
+
+        return false;
+    }
+
+    private static bool LineHasTrailingCommaAfterTable(string[] lines, int startIndex, int endIndex)
+    {
+        string endLine = lines[endIndex];
+        int close = endLine.LastIndexOf('}');
+        if (close < 0)
+            return false;
+        string after = endLine[(close + 1)..].Trim();
+        return after.StartsWith(',');
+    }
+
+    private static void AppendAssignment(
+        List<string> output,
+        string indent,
+        string key,
+        string value,
+        bool trailingComma,
+        int? insertAt = null)
+    {
+        string literal = ToLuaLiteral(value);
+        string comma = trailingComma ? "," : string.Empty;
+
+        // Multiline tables: keep internal newlines; first line shares the assignment.
+        string[] valueLines = literal.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+        if (valueLines.Length == 1)
+        {
+            string line = $"{indent}{key} = {valueLines[0]}{comma}";
+            if (insertAt is int at)
+                output.Insert(at, line);
+            else
+                output.Add(line);
+            return;
+        }
+
+        var block = new List<string>(valueLines.Length);
+        block.Add($"{indent}{key} = {valueLines[0]}");
+        for (int v = 1; v < valueLines.Length; v++)
+        {
+            string part = valueLines[v];
+            if (v == valueLines.Length - 1)
+                part += comma;
+            block.Add(part);
+        }
+
+        if (insertAt is int idx)
+            output.InsertRange(idx, block);
+        else
+            output.AddRange(block);
+    }
+
     private static string NormalizeLuaValue(string value)
     {
         value = value.Trim();
@@ -179,6 +389,9 @@ public static class SandboxManager
 
     private static string ToLuaLiteral(string value)
     {
+        if (IsLuaTableLiteral(value))
+            return value.Trim();
+
         if (string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
             || string.Equals(value, "false", StringComparison.OrdinalIgnoreCase))
         {
@@ -190,5 +403,38 @@ public static class SandboxManager
 
         string escaped = value.Replace("\\", "\\\\").Replace("\"", "\\\"");
         return $"\"{escaped}\"";
+    }
+
+    /// <summary>
+    /// Net change in brace depth for a line, ignoring braces inside strings and after '--' comments.
+    /// </summary>
+    public static int NetBraceDelta(string line)
+    {
+        int depth = 0;
+        bool inSingle = false;
+        bool inDouble = false;
+
+        for (int c = 0; c < line.Length; c++)
+        {
+            char ch = line[c];
+            char prev = c > 0 ? line[c - 1] : '\0';
+
+            if (!inSingle && !inDouble && ch == '-' && c + 1 < line.Length && line[c + 1] == '-')
+                break;
+
+            if (!inDouble && ch == '\'' && prev != '\\')
+                inSingle = !inSingle;
+            else if (!inSingle && ch == '"' && prev != '\\')
+                inDouble = !inDouble;
+            else if (!inSingle && !inDouble)
+            {
+                if (ch == '{')
+                    depth++;
+                else if (ch == '}')
+                    depth--;
+            }
+        }
+
+        return depth;
     }
 }

@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Local dedicated server control for Project Zomboid</strong><br/>
-  One Windows app for start/stop, restarts, config, RCON, backups, players, Discord — without a remote shell or a public web panel
+  One Windows app for start/stop, restarts, config, RCON, backups, players, Discord — without a remote shell or a public web panel.
 </p>
 
 <p align="center">
@@ -28,50 +28,52 @@
 ## What it does
 
 **Server Control**
-- Start / Stop / Restart with live status, address, players, and last restart time
-- Manager console with timestamps (capped so long sessions stay readable)
-- Hardware panel (CPU / RAM / disk) and configured ports plus server admins
-- Show Players on the Server tab for a quick connected-player list
+- Start / Stop / Restart with live status (Online only after `SERVER STARTED`), address, players, and last restart time
+- Server dashboard: status/players cards, live CPU / memory / disk meters, configured ports, recent manager console
+- Show Players for a quick connected-player list
+- Closing the app while the server runs asks whether to stop it or leave it in the background
 
 **Restarts & Automation**
 - Hourly restart schedule (pick any hours of the day)
 - Optional 10- and 5-minute chat warnings (1-minute warning always kept)
-- **Mod Update Auto-Restart**  -  when Steam Workshop mods update, optionally warn players, wait until the server is empty, then cleanly save → quit → start
+- **Mod Update Auto-Restart** — when Steam Workshop mods update, optionally warn players, wait until the server is empty, then cleanly save → quit → start (warn minutes and schedule delay share one value; cancel can notify Discord)
 - Manual controls: Check for Mod Updates Now, Restart Now, Schedule Restart In…, Cancel Pending Restart
 
 ![Mod Update Auto-Restart feature](docs/images/mod-update-auto-restart.png)
 
 **Config Management**
 - Edit `server.ini` / `servertest.ini` with categories and search
-- Dedicated SandboxVars.lua categories (gameplay rules where they belong)
+- Dedicated SandboxVars.lua categories (including Lua-table mod option blocks)
 - Clean Mods & Workshop section (Workshop IDs + Mod IDs)
-- **Config Profiles**  -  save named snapshots of the active server.ini + SandboxVars.lua, then load / rename / delete them (load backs up what you have first and offers a restart)
+- **Manual Mod Mapping** — optional friendly names when one Workshop item contains several Mod IDs
+- **Config Profiles** — save named snapshots of the active server.ini + SandboxVars.lua, then load / rename / delete them (load backs up what you have first and offers a restart)
 
 **RCON & Players**
 - Full RCON console + quick actions (list players, save world, server message, quit)
 - Player management: search, kick / ban / unban (including SteamID), access levels, godmode / invisible, teleport, items / XP
-- **Whitelist Manager**  -  accounts from the world database (username, access level, SteamID, banned); add / remove via RCON; info note if the server is open (`Open=true`)
+- **Whitelist Manager** — accounts from the world database (username, access level, SteamID, banned); add / remove via RCON; info note if the server is open (`Open=true`)
 
 **Tools**
-- Hub for backups, broadcasts, players, Discord, logs, mods, and admin commands
+- Hub for backups, broadcasts, players, Discord, logs, mods, SteamCMD server update, and admin commands
 
 ![Tools tab overview](docs/images/tools.png)
 
-- **Backup Manager**  -  dated zip of server configs + Multiplayer world; Backup Now or weekly / one-time schedules; progress in a corner panel (cancel supported)
+- **Backup Manager** — dated zip of server configs + Multiplayer world; Backup Now or weekly / one-time schedules; progress in a corner panel (cancel supported)
 
 ![Backup Manager with automatic scheduling](docs/images/backup-manager.png)
 
-- **Log Analyzer**  -  readable table from the server `logs` folder and `Zomboid\Logs`; filter by level / category, search, ERROR/WARN tinting, row context, System Info / Mod Info panels
+- **Log Analyzer** — readable table from the server `logs` folder and `Zomboid\Logs`; filter by level / category, search, ERROR/WARN tinting, row context, System Info / Mod Info panels
 
 ![Log Analyzer tool](docs/images/log-analyzer.png)
 
-- **Server Broadcaster**  -  up to 5 scheduled chat messages (one-time or recurring) plus Send Now
-- **Admin Command Reference**  -  searchable Build 42 admin commands (English / German keywords)
-- **Mod List**  -  Workshop & Mod IDs from server.ini with Steam links (tiles or list)
+- **Server update (SteamCMD)** — check/update the dedicated server to the configured Steam branch (B42 Stable by default)
+- **Server Broadcaster** — up to 5 scheduled chat messages (one-time or recurring) plus Send Now
+- **Admin Command Reference** — searchable Build 42 admin commands (English / German keywords)
+- **Mod List** — Workshop & Mod IDs from server.ini with Steam links (tiles or list)
 
 **Notifications**
-- Discord webhook with a master switch and five configurable events (enable toggle, editable template, placeholders, live preview)
-- Events: restart routine started, scheduled restart triggered, server restarted, mods updated (only when Workshop timestamps changed), custom hourly message
+- Discord webhook with a master switch and configurable events (enable toggle, editable template, placeholders, live preview)
+- Events include restart / online (after `SERVER STARTED`), mods updated, custom hourly message, and related restart notices
 
 **Statistics**
 - Dedicated Statistics tab (separate from the live hardware meters on Server)
@@ -81,9 +83,9 @@
 - Uptime % plus planned vs unexpected downtime; history kept for a configurable number of days (default 30)
 
 **App**
-- Multi-language UI (EN / DE complete; more languages for core strings)
-- Help & Info tab: version, in-app update check, Discord, donate
-- Single-file distribution  -  settings live in `%LocalAppData%\ZomboidManager\`
+- Bilingual UI (English & German)
+- Help & Info tab: version, in-app / startup update check, Discord, donate
+- Single-file distribution — settings live in `%LocalAppData%\ZomboidManager\`
 - Open source on this repository; official builds under [Releases](https://github.com/Vuscoo/zomboidmanager/releases)
 
 ---
@@ -132,7 +134,7 @@ Real `config.json` with passwords / webhooks must never be committed.
 
 ## Changelog
 
-See **[CHANGELOG.md](CHANGELOG.md)** for the full version history (v1.0.9 and earlier).
+See **[CHANGELOG.md](CHANGELOG.md)** for the full version history (v1.1.0 and earlier).
 
 ---
 

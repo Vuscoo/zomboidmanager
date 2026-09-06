@@ -14,6 +14,18 @@
     return typeof window.t === "function" ? window.t(key) : key;
   }
 
+  /** Parse a minutes field; empty/NaN → fallback; 0 is preserved when min allows it. */
+  function parseMinutesField(value, fallback, min, max) {
+    if (value === "" || value == null) {
+      return fallback;
+    }
+    const n = Number(value);
+    if (!Number.isFinite(n)) {
+      return fallback;
+    }
+    return Math.max(min, Math.min(max, Math.trunc(n)));
+  }
+
   function applyUiLanguage(lang) {
     if (window.I18N && typeof window.I18N.setLanguage === "function") {
       window.I18N.setLanguage(lang || "en");
@@ -181,9 +193,11 @@
       sendToCSharp("save_mod_update_auto_restart", {
         enabled: Boolean(document.getElementById("mod-restart-enabled")?.checked),
         warningMessage: document.getElementById("mod-restart-warning")?.value || "",
-        warnMinutesBefore: Number(document.getElementById("mod-restart-warn-minutes")?.value) || 5,
+        warnMinutesBefore: parseMinutesField(
+          document.getElementById("mod-restart-warn-minutes")?.value, 5, 0, 240),
         waitForEmpty: Boolean(document.getElementById("mod-restart-wait-empty")?.checked),
-        maxWaitMinutes: Number(document.getElementById("mod-restart-max-wait")?.value) || 60
+        maxWaitMinutes: parseMinutesField(
+          document.getElementById("mod-restart-max-wait")?.value, 60, 1, 240)
       });
       showToast(tr("modRestart.saved"), true);
     });
@@ -200,13 +214,117 @@
     });
 
     document.getElementById("mod-restart-schedule")?.addEventListener("click", () => {
-      const minutes = Number(document.getElementById("mod-restart-schedule-minutes")?.value) || 5;
+      const minutes = parseMinutesField(
+        document.getElementById("mod-restart-warn-minutes")?.value, 5, 1, 240);
       sendToCSharp("mod_update_schedule_restart", { minutes });
     });
 
     document.getElementById("mod-restart-cancel")?.addEventListener("click", () => {
       sendToCSharp("mod_update_cancel_restart");
     });
+
+    setupModMappingControls();
+  }
+
+  let manualModMappings = [];
+
+  function splitModIdList(value) {
+    return String(value || "")
+      .split(/[;,\n]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  function applyManualModMappings(list) {
+    manualModMappings = Array.isArray(list)
+      ? list.map((m) => ({
+          workshopId: m.workshopId || m.WorkshopId || "",
+          displayName: m.displayName || m.DisplayName || "",
+          modIds: Array.isArray(m.modIds || m.ModIds)
+            ? (m.modIds || m.ModIds).map((id) => String(id || "").trim()).filter(Boolean)
+            : splitModIdList(m.modIds || "")
+        }))
+      : [];
+    renderModMappingEditors();
+  }
+
+  function renderModMappingEditors() {
+    const container = document.getElementById("mod-list-mapping-rows");
+    if (!container) {
+      return;
+    }
+
+    container.innerHTML = "";
+    if (!manualModMappings.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted";
+      empty.textContent = tr("modMapping.hint");
+      container.appendChild(empty);
+    }
+
+    manualModMappings.forEach((mapping, index) => {
+        const row = document.createElement("div");
+        row.className = "mod-mapping-row";
+        row.innerHTML = `
+          <label class="form-field">
+            <span>${tr("modMapping.workshopId")}</span>
+            <input class="map-workshop" type="text" data-index="${index}" value="${escapeHtml(mapping.workshopId || "")}" placeholder="3487532256" autocomplete="off" />
+          </label>
+          <label class="form-field">
+            <span>${tr("modMapping.modIds")}</span>
+            <input class="map-mods" type="text" data-index="${index}" value="${escapeHtml((mapping.modIds || []).join("; "))}" placeholder="ModA; ModB; ModC" autocomplete="off" />
+          </label>
+          <label class="form-field">
+            <span>${tr("modMapping.displayName")}</span>
+            <input class="map-name" type="text" data-index="${index}" value="${escapeHtml(mapping.displayName || "")}" placeholder="Spongie's Character Customisation" autocomplete="off" />
+          </label>
+          <button class="btn secondary btn-sm map-remove" type="button" data-index="${index}">${tr("modMapping.remove")}</button>
+        `;
+        row.querySelector(".map-workshop")?.addEventListener("input", (ev) => {
+          const i = Number(ev.target.dataset.index);
+          if (manualModMappings[i]) manualModMappings[i].workshopId = ev.target.value.trim();
+        });
+        row.querySelector(".map-mods")?.addEventListener("input", (ev) => {
+          const i = Number(ev.target.dataset.index);
+          if (manualModMappings[i]) manualModMappings[i].modIds = splitModIdList(ev.target.value);
+        });
+        row.querySelector(".map-name")?.addEventListener("input", (ev) => {
+          const i = Number(ev.target.dataset.index);
+          if (manualModMappings[i]) manualModMappings[i].displayName = ev.target.value;
+        });
+        row.querySelector(".map-remove")?.addEventListener("click", () => {
+          const i = Number(row.querySelector(".map-remove")?.dataset.index);
+          if (Number.isInteger(i)) {
+            manualModMappings.splice(i, 1);
+            renderModMappingEditors();
+          }
+        });
+        container.appendChild(row);
+      });
+  }
+
+  function saveManualModMappings() {
+    sendToCSharp("save_manual_mod_mappings", {
+      mappings: manualModMappings.map((m) => ({
+        workshopId: (m.workshopId || "").trim(),
+        displayName: (m.displayName || "").trim(),
+        modIds: m.modIds || []
+      }))
+    });
+  }
+
+  let modMappingControlsReady = false;
+  function setupModMappingControls() {
+    if (modMappingControlsReady) {
+      return;
+    }
+    modMappingControlsReady = true;
+    const add = () => {
+      manualModMappings.push({ workshopId: "", displayName: "", modIds: [] });
+      renderModMappingEditors();
+    };
+    document.getElementById("mod-list-mapping-add")?.addEventListener("click", add);
+    document.getElementById("mod-list-mapping-save")?.addEventListener("click", saveManualModMappings);
   }
 
   function applyModUpdateAutoRestart(payload) {
@@ -222,11 +340,11 @@
         || "A mod has been updated. The server will restart in {minutes} minutes to apply the update.";
     }
     const warnMin = document.getElementById("mod-restart-warn-minutes");
-    if (warnMin) warnMin.value = String(Number(cfg.warnMinutesBefore) || 5);
+    if (warnMin) warnMin.value = String(parseMinutesField(cfg.warnMinutesBefore, 5, 0, 240));
     const waitEmpty = document.getElementById("mod-restart-wait-empty");
     if (waitEmpty) waitEmpty.checked = Boolean(cfg.waitForEmpty);
     const maxWait = document.getElementById("mod-restart-max-wait");
-    if (maxWait) maxWait.value = String(Number(cfg.maxWaitMinutes) || 60);
+    if (maxWait) maxWait.value = String(parseMinutesField(cfg.maxWaitMinutes, 60, 1, 240));
     const wrap = document.getElementById("mod-restart-max-wait-wrap");
     if (wrap && waitEmpty) {
       wrap.classList.toggle("hidden", !waitEmpty.checked);
@@ -282,7 +400,20 @@
 
     const line = document.createElement("div");
     line.className = `console-line${className ? ` ${className}` : ""}`;
-    line.textContent = `[${formatConsoleStamp()}] ${text}`;
+
+    if (output.id === "server-console-output") {
+      const time = document.createElement("span");
+      time.className = "console-time";
+      time.textContent = formatConsoleStamp();
+      const msg = document.createElement("span");
+      msg.className = "console-msg";
+      msg.textContent = text;
+      line.appendChild(time);
+      line.appendChild(msg);
+    } else {
+      line.textContent = `[${formatConsoleStamp()}] ${text}`;
+    }
+
     output.appendChild(line);
 
     while (output.childElementCount > CONSOLE_MAX_LINES) {
@@ -385,6 +516,8 @@
       const rconPort = Number(document.getElementById("settings-rcon-port")?.value || 0);
       const rconPassword = document.getElementById("settings-rcon-password")?.value || "";
       const uiLanguage = document.getElementById("settings-ui-language")?.value || "en";
+      const steamCmdPath = document.getElementById("settings-steamcmd-path")?.value?.trim() || "";
+      const steamUpdateBranch = document.getElementById("settings-steam-branch")?.value?.trim() || "";
 
       sendToCSharp("save_settings", {
         serverPath,
@@ -393,7 +526,9 @@
         rconHost,
         rconPort,
         rconPassword,
-        uiLanguage
+        uiLanguage,
+        steamCmdPath,
+        steamUpdateBranch
       });
     });
   }
@@ -441,6 +576,18 @@
       return input;
     }
 
+    if (type === "lua_table" || type === "textarea") {
+      const input = document.createElement("textarea");
+      input.dataset.key = entry.key;
+      input.className = "lua-table-editor";
+      input.value = entry.value ?? "";
+      const lineCount = String(entry.value || "").split(/\r?\n/).length;
+      input.rows = Math.min(24, Math.max(6, lineCount + 1));
+      input.spellcheck = false;
+      input.addEventListener("input", () => markModified(input));
+      return input;
+    }
+
     const input = document.createElement("input");
     input.dataset.key = entry.key;
 
@@ -474,7 +621,6 @@
 
     const container = document.getElementById(containerId);
     const editorCard = document.getElementById(editorCardId);
-    const sandboxHint = document.getElementById("sandbox-hint");
     if (!container) {
       return;
     }
@@ -482,9 +628,6 @@
     container.innerHTML = "";
 
     const normalized = (entries || []).map(normalizeIniEntry).filter((e) => e.key);
-    if (containerId === "config-categories-container" && sandboxHint) {
-      sandboxHint.style.display = "block";
-    }
 
     const grouped = new Map();
     normalized.forEach((entry) => {
@@ -560,7 +703,7 @@
         const tip = document.createElement("p");
         tip.className = "muted";
         tip.textContent =
-          "Workshop-IDs und Mod-IDs gehören zusammen (Reihenfolge beachten, Trenner: Semikolon). Übersicht auch unter Tools → Mod List.";
+          "Workshop-IDs und Mod-IDs gehören zusammen (Reihenfolge beachten, Trenner: Semikolon). Übersicht auch unter Tools → Mod Manager.";
         body.appendChild(tip);
       }
 
@@ -570,8 +713,12 @@
       grouped.get(categoryName).forEach((entry) => {
         const field = document.createElement("div");
         field.className = "config-field";
-        if (entry.inputType === "modlist") {
+        const type = String(entry.inputType || "text").toLowerCase();
+        if (type === "modlist" || type === "lua_table" || type === "textarea") {
           field.style.gridColumn = "1 / -1";
+          if (type === "lua_table" || type === "textarea") {
+            field.classList.add("config-field-lua-table");
+          }
         }
 
         const label = document.createElement("label");
@@ -914,6 +1061,63 @@
     appendCappedConsoleLine(document.getElementById("server-console-output"), text);
   }
 
+  const cpuSparkHistory = [];
+  const CPU_SPARK_POINTS = 30;
+
+  function drawCpuSparkline(pct) {
+    const canvas = document.getElementById("hw-cpu-spark");
+    if (!canvas) return;
+
+    cpuSparkHistory.push(Math.max(0, Math.min(100, Number(pct) || 0)));
+    while (cpuSparkHistory.length > CPU_SPARK_POINTS) {
+      cpuSparkHistory.shift();
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth || 280;
+    const cssH = canvas.clientHeight || 48;
+    canvas.width = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    if (cpuSparkHistory.length < 2) return;
+
+    const padY = 4;
+    const min = 0;
+    const max = 100;
+    const stepX = cssW / Math.max(1, CPU_SPARK_POINTS - 1);
+
+    ctx.beginPath();
+    cpuSparkHistory.forEach((v, i) => {
+      const x = i * stepX;
+      const y = cssH - padY - ((v - min) / (max - min)) * (cssH - padY * 2);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    const lastX = (cpuSparkHistory.length - 1) * stepX;
+    ctx.lineTo(lastX, cssH);
+    ctx.lineTo(0, cssH);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(138, 92, 246, 0.12)";
+    ctx.fill();
+
+    ctx.beginPath();
+    cpuSparkHistory.forEach((v, i) => {
+      const x = i * stepX;
+      const y = cssH - padY - ((v - min) / (max - min)) * (cssH - padY * 2);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#8a5cf6";
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.stroke();
+  }
+
   function applyHardwareStats(payload) {
     const hw = payload?.hardware || {};
     const setText = (id, value) => {
@@ -921,24 +1125,24 @@
       if (el) el.textContent = value;
     };
     setText("hw-cpu-name", hw.cpuName || "–");
-    setText("hw-ram-total", hw.ramTotalGb != null ? `${hw.ramTotalGb} GB` : "–");
+    setText("hw-ram-total", hw.ramTotalGb != null ? `${hw.ramTotalGb} GB total` : "–");
     setText("hw-disk-total", hw.diskTotalGb != null ? `${hw.diskRoot || ""} ${hw.diskTotalGb} GB` : "–");
 
     const cpuPct = Number(hw.cpuUsage) || 0;
     const ramPct = hw.ramTotalBytes > 0 ? Math.round((hw.ramUsedBytes / hw.ramTotalBytes) * 100) : 0;
     const diskPct = hw.diskTotalBytes > 0 ? Math.round((hw.diskUsedBytes / hw.diskTotalBytes) * 100) : 0;
 
-    setText("hw-cpu-pct", `${cpuPct.toFixed(1)}%`);
-    setText("hw-ram-pct", `${hw.ramUsedGb ?? "–"} / ${hw.ramTotalGb ?? "–"} GB (${ramPct}%)`);
-    setText("hw-disk-pct", `${hw.diskUsedGb ?? "–"} / ${hw.diskTotalGb ?? "–"} GB (${diskPct}%)`);
+    setText("hw-cpu-pct", `${cpuPct.toFixed(0)}%`);
+    setText("hw-ram-pct", `${hw.ramUsedGb ?? "–"} / ${hw.ramTotalGb ?? "–"} GB`);
+    setText("hw-disk-pct", `${diskPct}%`);
 
     const setBar = (id, pct) => {
       const el = document.getElementById(id);
       if (el) el.style.width = `${Math.max(0, Math.min(100, pct))}%`;
     };
-    setBar("hw-cpu-bar", cpuPct);
     setBar("hw-ram-bar", ramPct);
     setBar("hw-disk-bar", diskPct);
+    drawCpuSparkline(cpuPct);
 
     const portsEl = document.getElementById("hw-ports");
     if (portsEl) {
@@ -946,13 +1150,6 @@
       portsEl.textContent = ports.length
         ? ports.map((p) => `${p.name}: ${p.value}`).join(" · ")
         : "–";
-    }
-    const adminsEl = document.getElementById("hw-admins");
-    if (adminsEl) {
-      const admins = payload?.admins || [];
-      adminsEl.textContent = admins.length
-        ? admins.join(", ")
-        : (payload?.adminsNote || "–");
     }
   }
 
@@ -1280,6 +1477,32 @@
     }
   }
 
+  function setSteamCmdProgressModal(active, label) {
+    const modal = document.getElementById("steamcmd-progress-modal");
+    if (!modal) {
+      return;
+    }
+    modal.classList.toggle("hidden", !active);
+    const labelEl = document.getElementById("steamcmd-progress-label");
+    if (labelEl) {
+      labelEl.textContent = label || tr("steamcmd.progressWait");
+    }
+    const card = document.getElementById("tool-server-update");
+    if (card) {
+      card.classList.toggle("tool-card-busy", active);
+      card.setAttribute("aria-busy", active ? "true" : "false");
+    }
+  }
+
+  window.requestServerUpdate = function requestServerUpdate() {
+    const card = document.getElementById("tool-server-update");
+    if (card?.classList.contains("tool-card-busy")) {
+      showToast(tr("steamcmd.busy"), false);
+      return;
+    }
+    sendToCSharp("update_server");
+  };
+
   function setBackupProgressModal(active, done, file, total, percent) {
     const modal = document.getElementById("backup-progress-modal");
     if (!modal) {
@@ -1382,7 +1605,8 @@
 
   window.showToast = showToast;
 
-  let modViewMode = "tiles";
+  let modViewMode = "list";
+  let lastModListPayload = null;
 
   window.openModListTool = function openModListTool() {
     ensureLazySetup("modList", setupModListControls);
@@ -2620,6 +2844,7 @@
       date,
       datetime: now.toLocaleString(),
       hour,
+      minutes: "5",
       mods: modsSample
     };
   }
@@ -2865,6 +3090,7 @@
   }
 
   function renderModList(payload) {
+    lastModListPayload = payload;
     const container = document.getElementById("mod-list-container");
     const stats = document.getElementById("mod-list-stats");
     const source = document.getElementById("mod-list-source");
@@ -2880,14 +3106,18 @@
       return;
     }
 
+    if (payload.mappings) {
+      applyManualModMappings(payload.mappings);
+    }
     if (source) {
       source.textContent = payload.path ? `Quelle: ${payload.path}` : "";
     }
     if (stats) {
-      stats.textContent = `Workshop-IDs: ${payload.workshopCount ?? 0} · Mod-IDs: ${payload.modCount ?? 0}`;
+      stats.textContent = `Workshop-IDs: ${payload.workshopCount ?? 0} · Mod-IDs: ${payload.modCount ?? 0} · Einträge: ${(payload.mods || []).length}`;
     }
 
-    container.className = modViewMode === "list" ? "mod-tiles list-mode" : "mod-tiles";
+    const isList = modViewMode === "list";
+    container.className = isList ? "mod-tiles list-mode compact" : "mod-tiles tiles-mode";
     container.innerHTML = "";
 
     const mods = payload.mods || [];
@@ -2897,21 +3127,69 @@
     }
 
     mods.forEach((mod) => {
+      const title = mod.name || mod.modId || mod.workshopId || "Unknown mod";
+      const ids = Array.isArray(mod.modIds) && mod.modIds.length
+        ? mod.modIds
+        : (mod.modId ? [mod.modId] : []);
+      const badge = mod.manualMapping
+        ? `<span class="mod-pack-badge">${tr("modMapping.pack")}</span>`
+        : "";
+
+      if (isList) {
+        const row = document.createElement("div");
+        row.className = "mod-row";
+        if (mod.manualMapping) {
+          row.classList.add("mod-row-bundle");
+        }
+        const idsInline = ids.length
+          ? ids.map((id) => `<code>${escapeHtml(id)}</code>`).join(" · ")
+          : "";
+        const idsLine = ids.length > 1 || mod.manualMapping
+          ? `<div class="mod-row-ids muted">${tr("modMapping.modIdsLabel")}: ${idsInline || "–"}</div>`
+          : "";
+        const steamCell = mod.steamUrl
+          ? `<a href="#" class="mod-row-steam steam-link">${tr("mod.openSteam")}</a>`
+          : `<span class="muted mod-row-steam">${tr("mod.noSteam")}</span>`;
+        row.innerHTML = `
+          <div class="mod-row-main">
+            <span class="mod-row-index">#${mod.index}</span>
+            <span class="mod-row-title">${escapeHtml(title)}${badge}</span>
+            <span class="mod-row-workshop muted"><code>${escapeHtml(mod.workshopId || "–")}</code></span>
+            ${steamCell}
+          </div>
+          ${idsLine}
+        `;
+        const link = row.querySelector(".steam-link");
+        if (link) {
+          link.addEventListener("click", (e) => {
+            e.preventDefault();
+            sendToCSharp("open_url", { url: mod.steamUrl });
+          });
+        }
+        container.appendChild(row);
+        return;
+      }
+
       const card = document.createElement("div");
       card.className = "mod-card";
-      const title = mod.name || mod.modId || mod.workshopId || "Unknown mod";
+      if (mod.manualMapping) {
+        card.classList.add("mod-card-pack");
+      }
+      const idsHtml = ids.length
+        ? ids.map((id) => `<code>${escapeHtml(id)}</code>`).join(" · ")
+        : "<code>–</code>";
       const steam = mod.steamUrl
         ? `<a href="#" data-url="${mod.steamUrl}" class="steam-link">${tr("mod.openSteam")}</a>`
         : `<span class='muted'>${tr("mod.noSteam")}</span>`;
       card.innerHTML = `
-        <h4>#${mod.index} ${title}</h4>
-        <div class="muted">Mod-ID: <code>${mod.modId || "–"}</code></div>
-        <div class="muted">Workshop-ID: <code>${mod.workshopId || "–"}</code></div>
-        <div style="margin-top:8px">${steam}</div>
+        <h4>#${mod.index} ${escapeHtml(title)}${badge}</h4>
+        <div class="muted mod-card-meta">${tr("modMapping.modIdsLabel")}: ${idsHtml}</div>
+        <div class="muted mod-card-meta">Workshop: <code>${escapeHtml(mod.workshopId || "–")}</code></div>
+        <div class="mod-card-actions">${steam}</div>
       `;
-      const link = card.querySelector(".steam-link");
-      if (link) {
-        link.addEventListener("click", (e) => {
+      const cardLink = card.querySelector(".steam-link");
+      if (cardLink) {
+        cardLink.addEventListener("click", (e) => {
           e.preventDefault();
           sendToCSharp("open_url", { url: mod.steamUrl });
         });
@@ -2975,21 +3253,20 @@
     if (tilesBtn) {
       tilesBtn.addEventListener("click", () => {
         modViewMode = "tiles";
-        const container = document.getElementById("mod-list-container");
-        if (container) {
-          container.classList.remove("list-mode");
+        if (lastModListPayload) {
+          renderModList(lastModListPayload);
         }
       });
     }
     if (listBtn) {
       listBtn.addEventListener("click", () => {
         modViewMode = "list";
-        const container = document.getElementById("mod-list-container");
-        if (container) {
-          container.classList.add("list-mode");
+        if (lastModListPayload) {
+          renderModList(lastModListPayload);
         }
       });
     }
+    setupModMappingControls();
   }
 
   function applyServerStatus(payload) {
@@ -2998,15 +3275,18 @@
     }
 
     const statusEl = document.getElementById("server-status-text");
+    const statusSub = document.getElementById("server-status-sub");
+    const statusDot = document.getElementById("dash-status-dot");
     const addressEl = document.getElementById("server-address-text");
     const playersEl = document.getElementById("server-players-text");
+    const playersCountEl = document.getElementById("server-players-count");
+    const playersBar = document.getElementById("server-players-bar");
     const lastRestartEl = document.getElementById("server-lastrestart-text");
     const sidebarStatus = document.getElementById("sidebar-status");
 
     const status = String(payload.status || "").toLowerCase();
     const startBtn = document.getElementById("btn-server-start");
     if (startBtn) {
-      // Keep clickable so we can show a clear toast when already online.
       startBtn.disabled = false;
       startBtn.classList.toggle("disabled", false);
       startBtn.title = status === "online"
@@ -3014,13 +3294,38 @@
         : "";
     }
 
-    if (statusEl) {
-      statusEl.textContent = status === "online"
-        ? tr("server.online")
+    const label = status === "online"
+      ? tr("server.online")
+      : status === "starting"
+        ? tr("server.starting")
         : status === "offline"
           ? tr("server.offline")
           : (payload.status || "–");
-      statusEl.style.color = status === "online" ? "var(--success)" : "var(--error)";
+
+    const sub = status === "online"
+      ? tr("server.onlineSub")
+      : status === "starting"
+        ? tr("server.startingSub")
+        : tr("server.offlineSub");
+
+    if (statusEl) {
+      statusEl.textContent = label;
+      statusEl.classList.remove("is-online", "is-starting", "is-offline");
+      statusEl.classList.add(
+        status === "online" ? "is-online" : status === "starting" ? "is-starting" : "is-offline"
+      );
+      statusEl.style.color = "";
+    }
+
+    if (statusSub) {
+      statusSub.textContent = sub;
+    }
+
+    if (statusDot) {
+      statusDot.classList.remove("online", "offline", "starting");
+      statusDot.classList.add(
+        status === "online" ? "online" : status === "starting" ? "starting" : "offline"
+      );
     }
 
     if (addressEl) {
@@ -3031,6 +3336,20 @@
       playersEl.textContent = payload.players || "–";
     }
 
+    const count = Number(payload.playerCount);
+    const max = Number(payload.maxPlayers);
+    if (playersCountEl) {
+      const countLabel = Number.isFinite(count) ? String(count) : "0";
+      const maxLabel = Number.isFinite(max) && max > 0 ? String(max) : "–";
+      playersCountEl.textContent = `${countLabel} / ${maxLabel}`;
+    }
+    if (playersBar) {
+      const pct = Number.isFinite(max) && max > 0 && Number.isFinite(count)
+        ? Math.max(0, Math.min(100, (count / max) * 100))
+        : 0;
+      playersBar.style.width = `${pct}%`;
+    }
+
     if (lastRestartEl) {
       const lr = String(payload.lastRestart || "");
       lastRestartEl.textContent = (!lr || /no restart/i.test(lr))
@@ -3038,19 +3357,27 @@
         : lr;
     }
 
+    const navLabel = status === "online"
+      ? tr("nav.online")
+      : status === "starting"
+        ? tr("nav.starting")
+        : tr("nav.offline");
+
     if (sidebarStatus) {
       const text = sidebarStatus.querySelector(".status-text");
       if (text) {
-        text.textContent = status === "online" ? tr("nav.online") : tr("nav.offline");
+        text.textContent = navLabel;
       } else {
-        sidebarStatus.textContent = status === "online" ? tr("nav.online") : tr("nav.offline");
+        sidebarStatus.textContent = navLabel;
       }
     }
 
     const sidebarDot = document.getElementById("sidebar-status-dot");
     if (sidebarDot) {
-      sidebarDot.classList.remove("online", "offline");
-      sidebarDot.classList.add(status === "online" ? "online" : "offline");
+      sidebarDot.classList.remove("online", "offline", "starting");
+      sidebarDot.classList.add(
+        status === "online" ? "online" : status === "starting" ? "starting" : "offline"
+      );
     }
   }
 
@@ -3081,10 +3408,17 @@
     applySchedulerButton(Boolean(payload.schedulerActive));
     applyRestartWarnings(payload);
     applyModUpdateAutoRestart(payload);
+    applyManualModMappings(payload.manualModMappings || []);
 
     setInputValue("settings-server-path", payload.serverPath || "");
     setInputValue("settings-zomboid-path", payload.zomboidDataPath || "");
     setInputValue("settings-start-bat", payload.startBat || "");
+    setInputValue("settings-steamcmd-path", payload.steamCmdPath || "");
+    const steamBranchSelect = document.getElementById("settings-steam-branch");
+    if (steamBranchSelect) {
+      const branch = payload.steamUpdateBranch || "";
+      steamBranchSelect.value = branch === "public" ? "" : branch;
+    }
     setInputValue("settings-rcon-host", payload.rconHost || "127.0.0.1");
     setInputValue("settings-rcon-port", payload.rconPort ?? 27015);
     setInputValue("settings-rcon-password", payload.rconPassword || "");
@@ -3142,6 +3476,28 @@
       return;
     }
 
+    if (message.type === "confirm_update") {
+      const msg = (message.payload && message.payload.message) || "Fortfahren?";
+      if (confirm(msg)) {
+        switchTab("server");
+        sendToCSharp("update_server_confirmed");
+      }
+      return;
+    }
+
+    if (message.type === "steamcmd_update_status") {
+      const active = Boolean(message.payload?.active);
+      const label = message.payload?.label || "";
+      setSteamCmdProgressModal(active, label);
+      return;
+    }
+
+    if (message.type === "toast_success") {
+      const text = (message.payload && message.payload.message) || "";
+      showToast(text, true);
+      return;
+    }
+
     if (message.type === "mod_update_restart_status") {
       applyModUpdateRestartStatus(message.payload || {});
       return;
@@ -3154,6 +3510,23 @@
 
     if (message.type === "mod_update_auto_restart_saved") {
       showToast(tr("modRestart.saved"), true);
+      return;
+    }
+
+    if (message.type === "manual_mod_mappings_saved") {
+      const warnings = Array.isArray(message.payload?.warnings) ? message.payload.warnings : [];
+      if (message.payload?.mappings) {
+        applyManualModMappings(message.payload.mappings);
+      }
+      const warnBox = document.getElementById("mod-list-mapping-warnings");
+      if (warnBox) {
+        warnBox.textContent = warnings.join(" ");
+        warnBox.style.color = warnings.length ? "var(--warning)" : "";
+      }
+      showToast(
+        warnings.length ? `${tr("modMapping.saved")} ${warnings[0]}` : tr("modMapping.saved"),
+        warnings.length === 0
+      );
       return;
     }
 

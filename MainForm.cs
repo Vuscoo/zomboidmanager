@@ -19,6 +19,9 @@ public partial class MainForm : Form
     };
 
     private bool _updateInProgress;
+    private bool _steamCmdUpdateInFlight;
+    /// <summary>Normalized release tag the user dismissed in this session's startup prompt (no re-nag).</summary>
+    private string? _startupUpdateDismissedVersion;
 
     private readonly ScheduleManager _scheduleManager = new();
     private readonly RconManager _rconManager = new();
@@ -39,8 +42,36 @@ public partial class MainForm : Form
     private bool _modUpdateCheckInFlight;
     private bool _userStopInProgress;
     private readonly Stopwatch _startupWatch = Stopwatch.StartNew();
+    private ServerStartupWatcher? _serverStartupWatcher;
+    private CancellationTokenSource? _serverStartupWatchCts;
+    /// <summary>True while waiting for *** SERVER STARTED *** after a manager-launched boot.</summary>
+    private bool _awaitingServerReady;
+    /// <summary>True after the SERVER STARTED log marker was seen for the current boot.</summary>
+    private bool _serverReadyConfirmed;
 
     private AppConfig _config;
+    private string Ui(string key) => AppLocalizer.Get(_config.UiLanguage, key);
+    private string Ui(string key, params object[] args) => AppLocalizer.Format(_config.UiLanguage, key, args);
+
+    private string ResolveSchedulerLog(string raw)
+    {
+        if (raw.StartsWith("scheduler.preAnnounce|", StringComparison.Ordinal))
+        {
+            string[] parts = raw.Split('|');
+            if (parts.Length >= 3)
+                return Ui("scheduler.preAnnounce", parts[1], parts[2]);
+        }
+
+        if (raw.StartsWith("scheduler.restartHour|", StringComparison.Ordinal))
+        {
+            string[] parts = raw.Split('|');
+            if (parts.Length >= 2)
+                return Ui("scheduler.restartHour", parts[1]);
+        }
+
+        return Ui(raw);
+    }
+
     private WebView2 _webView = null!;
     private DateTime? _lastRestartTime;
     private bool _restartInProgress;
@@ -52,10 +83,17 @@ public partial class MainForm : Form
     private LogAnalyzeSession? _logSession;
     private CancellationTokenSource? _logAnalyzeCts;
     private readonly object _logAnalyzeLock = new();
+    private readonly string? _configBrokenBackupPath;
+    private readonly string? _configLoadErrorDetail;
+    private bool _allowClose;
+    private bool _configBrokenWarningShown;
 
     public MainForm()
     {
-        _config = ConfigManager.Load();
+        var (loaded, brokenBackup, loadError) = ConfigManager.LoadWithStatus();
+        _config = loaded;
+        _configBrokenBackupPath = brokenBackup;
+        _configLoadErrorDetail = loadError;
         _config.DiscordEvents = DiscordEventCatalog.Normalize(_config.DiscordEvents, _config.DiscordCustomMessage);
         _config.ModUpdateAutoRestart ??= new ModUpdateAutoRestartConfig();
         _config.StatsIntervalMinutes = StatsHistoryStore.ClampIntervalMinutes(
@@ -82,6 +120,7 @@ public partial class MainForm : Form
         BackColor = AppTheme.BackgroundDark;
         ApplyAppIcon();
 
+        _serverProcessManager.SetServerContext(_config.ServerPath, _config.StartBat);
         _webView = new WebView2
         {
             Dock = DockStyle.Fill
@@ -191,7 +230,7 @@ public partial class MainForm : Form
     {
         _backupScheduler.BackupDue += () =>
         {
-            SendToWeb("log", "Scheduled backup triggered.");
+            SendToWeb("log", Ui("backup.scheduledTriggered"));
             _ = HandleCreateBackupAsync(fromScheduler: true);
         };
         _backupScheduler.ScheduleDisabled += () =>
@@ -199,7 +238,7 @@ public partial class MainForm : Form
             _config.BackupSchedule = _backupScheduler.Schedule;
             ConfigManager.Save(_config);
             SendToWeb("backup_schedule_status", _backupScheduler.BuildStatusPayload());
-            SendToWeb("log", "One-time backup schedule disabled after run.");
+            SendToWeb("log", Ui("backup.oneTimeDisabled"));
         };
     }
 
@@ -240,17 +279,15 @@ public partial class MainForm : Form
     {
         _scheduleManager.LogMessage += message =>
         {
-            SendToWeb("log", message);
-            SendToWeb("server_console", new { line = message });
+            string line = ResolveSchedulerLog(message);
+            SendToWeb("log", line);
+            SendToWeb("server_console", new { line = line });
         };
         _scheduleManager.RestartTriggered += hour =>
         {
-            string msg = $"Scheduled restart triggered (hour {hour:00}:00).";
+            string msg = Ui("scheduler.scheduledRestart", hour);
             SendToWeb("log", msg);
             SendToWeb("server_console", new { line = msg });
-            _ = NotifyDiscordEventAsync(
-                DiscordEventCatalog.ScheduledRestart,
-                new Dictionary<string, string> { ["hour"] = hour.ToString("00") });
             _ = ExecuteRestartRoutine(RestartReasons.Scheduled);
         };
         _scheduleManager.WarningAnnouncementTriggered += minutesBefore =>
@@ -266,6 +303,7 @@ public partial class MainForm : Form
             try
             {
                 SendToWeb("server_console", new { line });
+                _serverStartupWatcher?.ObserveLine(line);
             }
             catch
             {
@@ -276,7 +314,8 @@ public partial class MainForm : Form
         {
             try
             {
-                SendToWeb("server_console", new { line = "[server process exited]" });
+                ClearServerBootState();
+                SendToWeb("server_console", new { line = Ui("server.processExited") });
                 if (!_restartInProgress && !_userStopInProgress)
                     _statsCollector.NotifyUnexpectedExit();
                 // Cheap online/offline only — may fire while Server tab is hidden.
@@ -326,6 +365,10 @@ public partial class MainForm : Form
             StartDeferredBackgroundServices();
             Debug.WriteLine(
                 $"[startup] WebView NavigationCompleted at {_startupWatch.ElapsedMilliseconds} ms");
+
+            // Non-blocking: GitHub check after UI is interactive; popup only if newer.
+            _ = MaybePromptStartupUpdateAsync();
+            MaybeWarnBrokenConfig();
 
             SendToWeb("app_info", new { version = CurrentVersion });
             if (Environment.GetCommandLineArgs().Any(a =>
@@ -405,6 +448,10 @@ public partial class MainForm : Form
 
                 case "save_mod_update_auto_restart":
                     HandleSaveModUpdateAutoRestart(message.Data);
+                    break;
+
+                case "save_manual_mod_mappings":
+                    HandleSaveManualModMappings(message.Data);
                     break;
 
                 case "mod_update_check_now":
@@ -534,6 +581,14 @@ public partial class MainForm : Form
                     _ = HandleStopServerAsync();
                     break;
 
+                case "update_server":
+                    HandleUpdateServer();
+                    break;
+
+                case "update_server_confirmed":
+                    _ = HandleUpdateServerConfirmedAsync();
+                    break;
+
                 case "create_backup":
                     _ = HandleCreateBackupAsync();
                     break;
@@ -661,8 +716,66 @@ public partial class MainForm : Form
     {
         Version? asm = Assembly.GetExecutingAssembly().GetName().Version;
         if (asm is null)
-            return "1.0.0";
+            return "1.1.0";
         return $"{asm.Major}.{asm.Minor}.{asm.Build}";
+    }
+
+    /// <summary>
+    /// Background GitHub check after the UI is ready. Silent on failure; Yes/No popup only when newer.
+    /// </summary>
+    private async Task MaybePromptStartupUpdateAsync()
+    {
+        try
+        {
+            // Let the first paint / settings hydrate finish before any network work.
+            await Task.Delay(1500);
+            if (IsDisposed || _updateInProgress)
+                return;
+
+            AppUpdater.CheckResult check = await AppUpdater.CheckAsync(CurrentVersion);
+            if (!check.UpdateAvailable || string.IsNullOrWhiteSpace(check.DownloadUrl))
+                return;
+
+            string tag = check.LatestTag ?? string.Empty;
+            string normalized = AppUpdater.NormalizeVersion(tag);
+            if (string.Equals(_startupUpdateDismissedVersion, normalized, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            if (IsDisposed)
+                return;
+
+            bool accepted = false;
+            void Ask()
+            {
+                if (IsDisposed)
+                    return;
+                string display = tag.StartsWith("v", StringComparison.OrdinalIgnoreCase)
+                    ? tag
+                    : "v" + normalized;
+                DialogResult answer = MessageBox.Show(
+                    this,
+                    Ui("appUpdate.startupPrompt", display),
+                    Ui("appUpdate.startupTitle"),
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Information,
+                    MessageBoxDefaultButton.Button2);
+                accepted = answer == DialogResult.Yes;
+                if (!accepted)
+                    _startupUpdateDismissedVersion = normalized;
+            }
+
+            if (InvokeRequired)
+                Invoke(Ask);
+            else
+                Ask();
+
+            if (accepted)
+                await CheckForUpdatesAsync();
+        }
+        catch
+        {
+            // No internet / GitHub down / rate limit — never block or nag on startup.
+        }
     }
 
     private async Task CheckForUpdatesAsync()
@@ -672,7 +785,7 @@ public partial class MainForm : Form
             SendToWeb("update_result", new
             {
                 status = "busy",
-                text = "An update is already in progress."
+                text = Ui("appUpdate.inProgress")
             });
             return;
         }
@@ -683,7 +796,7 @@ public partial class MainForm : Form
             SendToWeb("update_result", new
             {
                 status = "checking",
-                text = "Checking for updates…"
+                text = Ui("appUpdate.checking")
             });
 
             AppUpdater.CheckResult check = await AppUpdater.CheckAsync(CurrentVersion);
@@ -720,7 +833,7 @@ public partial class MainForm : Form
             {
                 status = "downloading",
                 progress = 0,
-                text = $"Updating to {tag}…"
+                text = Ui("appUpdate.downloading", tag)
             });
 
             await AppUpdater.DownloadAsync(check.DownloadUrl, tempExe, progress =>
@@ -729,14 +842,14 @@ public partial class MainForm : Form
                 {
                     status = "downloading",
                     progress,
-                    text = $"Updating to {tag}… {progress}%"
+                    text = Ui("appUpdate.downloadingProgress", tag, progress)
                 });
             });
 
             SendToWeb("update_result", new
             {
                 status = "applying",
-                text = $"Restarting into {tag}…"
+                text = Ui("appUpdate.restarting", tag)
             });
             await Task.Delay(500);
 
@@ -767,7 +880,7 @@ public partial class MainForm : Form
             SendToWeb("update_result", new
             {
                 status = "error",
-                text = $"Update failed: {ex.Message}"
+                text = Ui("appUpdate.failed", ex.Message)
             });
         }
         finally
@@ -795,7 +908,7 @@ public partial class MainForm : Form
         {
             SendToWeb("update_result", new
             {
-                text = $"Could not open link: {ex.Message}"
+                text = Ui("appUpdate.couldNotOpenLink", ex.Message)
             });
         }
     }
@@ -826,7 +939,7 @@ public partial class MainForm : Form
                 SendToWeb("mod_list_data", new
                 {
                     success = false,
-                    message = "Keine INI geladen. Bitte zuerst im Config-Tab eine server.ini laden.",
+                    message = Ui("config.noIniLoaded"),
                     mods = Array.Empty<object>()
                 });
                 return;
@@ -834,26 +947,8 @@ public partial class MainForm : Form
 
             Dictionary<string, string> raw = IniManager.ReadIni(path);
             (List<string> workshopIds, List<string> modIds) = IniManager.ParseModLists(raw);
-
-            int count = Math.Max(workshopIds.Count, modIds.Count);
-            var mods = new List<object>();
-            for (int i = 0; i < count; i++)
-            {
-                string workshopId = i < workshopIds.Count ? workshopIds[i] : "";
-                string modId = i < modIds.Count ? modIds[i] : "";
-                string steamUrl = string.IsNullOrWhiteSpace(workshopId)
-                    ? ""
-                    : $"https://steamcommunity.com/sharedfiles/filedetails/?id={workshopId}";
-
-                mods.Add(new
-                {
-                    index = i + 1,
-                    workshopId,
-                    modId,
-                    steamUrl,
-                    name = string.IsNullOrWhiteSpace(modId) ? workshopId : modId
-                });
-            }
+            List<ManualModMapping> mappings = ManualModMappingHelper.Normalize(_config.ManualModMappings);
+            List<ModListDisplayItem> items = ManualModMappingHelper.BuildDisplayItems(workshopIds, modIds, mappings);
 
             SendToWeb("mod_list_data", new
             {
@@ -861,7 +956,8 @@ public partial class MainForm : Form
                 path,
                 workshopCount = workshopIds.Count,
                 modCount = modIds.Count,
-                mods
+                mappings = mappings.Select(ManualModMappingHelper.ToUiPayload),
+                mods = items.Select(ManualModMappingHelper.ToUiPayload)
             });
         }
         catch (Exception ex)
@@ -885,77 +981,87 @@ public partial class MainForm : Form
     {
         try
         {
+            if (_restartInProgress || _userStopInProgress || _modUpdateRestartFlow.IsActive)
+            {
+                SendToWeb("server_action_result", new
+                {
+                    success = false,
+                    message = Ui("restart.inProgress")
+                });
+                return;
+            }
+
             string? batPath = ResolveStartBatPath();
             if (batPath is null)
             {
                 SendToWeb("server_action_result", new
                 {
                     success = false,
-                    message = "Start file not found. Configure Server folder + Start .bat in Settings."
+                    message = Ui("server.startBatMissing")
                 });
                 return;
             }
 
-            bool javaRunning = false;
-            Process[] javaProcesses = Process.GetProcessesByName("java");
-            try
-            {
-                javaRunning = javaProcesses.Length > 0;
-            }
-            finally
-            {
-                foreach (Process jp in javaProcesses)
-                    jp.Dispose();
-            }
+            bool javaRunning = _serverProcessManager.IsPzServerJavaRunning();
 
-            if (javaRunning && !_serverProcessManager.IsManagedProcessRunning)
+            if (javaRunning || _serverProcessManager.IsManagedProcessRunning)
             {
                 SendToWeb("server_console", new
                 {
-                    line = "Server already appears online (Java process detected). Press Stop first, then Start."
+                    line = Ui("server.alreadyOnline")
                 });
                 SendToWeb("server_action_result", new
                 {
                     success = false,
-                    message = "Server already online. Press Stop first, then Start."
+                    message = Ui("server.alreadyOnlineShort")
                 });
                 return;
             }
 
-            SendToWeb("server_console", new { line = $"Starting: {batPath}" });
+            SendToWeb("server_console", new { line = Ui("server.starting", batPath) });
             Process process = _serverProcessManager.StartServer(batPath, embedConsole: true);
-            SendToWeb("server_console", new { line = $"Server console opened (PID {process.Id})." });
+            SendToWeb("server_console", new { line = Ui("server.consoleOpened", process.Id) });
             SendToWeb("server_action_result", new
             {
                 success = true,
-                message = "Server start requested — console window should open."
+                message = Ui("server.startRequested")
             });
-            _ = NotifyDiscordAsync("▶️ Server start requested.");
+            ArmServerStartedDiscordWatch();
             _ = HandleGetServerStatusAsync();
         }
         catch (Exception ex)
         {
-            SendToWeb("server_console", new { line = "Start failed: " + ex.Message });
+            SendToWeb("server_console", new { line = Ui("server.startFailed", ex.Message) });
             SendToWeb("server_action_result", new { success = false, message = ex.Message });
         }
     }
 
     private async Task HandleStopServerAsync()
     {
+        if (_restartInProgress || _userStopInProgress || _modUpdateRestartFlow.IsActive)
+        {
+            SendToWeb("server_action_result", new
+            {
+                success = false,
+                message = Ui("restart.inProgress")
+            });
+            return;
+        }
+
         _userStopInProgress = true;
         try
         {
-            SendToWeb("server_console", new { line = "Stopping via RCON quit..." });
-            await NotifyDiscordAsync("🛑 Server stop requested (RCON quit).");
+            CancelServerStartedDiscordWatch();
+            SendToWeb("server_console", new { line = Ui("server.stoppingRcon") });
             string response = await _rconManager.SendCommandAsync(
                 _config.RconHost, _config.RconPort, _config.RconPassword, "quit");
-            SendToWeb("server_console", new { line = $"RCON: {response}" });
+            SendToWeb("server_console", new { line = Ui("rcon.prefix", response) });
             await Task.Delay(8000);
 
             foreach (string message in _serverProcessManager.KillServerTree())
                 SendToWeb("server_console", new { line = message });
 
-            SendToWeb("server_action_result", new { success = true, message = "Stop completed." });
+            SendToWeb("server_action_result", new { success = true, message = Ui("server.stopCompleted") });
             await HandleGetServerStatusAsync();
         }
         catch (Exception ex)
@@ -968,12 +1074,191 @@ public partial class MainForm : Form
         }
     }
 
+    private async Task ExecuteStopOnlyAsync()
+    {
+        string response = await _rconManager.SendCommandAsync(
+            _config.RconHost, _config.RconPort, _config.RconPassword, "quit");
+        SendToWeb("server_console", new { line = Ui("rcon.prefix", response) });
+        await Task.Delay(15000);
+
+        if (_serverProcessManager.IsPzServerJavaRunning())
+        {
+            foreach (string message in _serverProcessManager.KillServerTree())
+                SendToWeb("server_console", new { line = message });
+        }
+
+        await HandleGetServerStatusAsync();
+    }
+
+    private void HandleUpdateServer()
+    {
+        if (_steamCmdUpdateInFlight)
+        {
+            SendToWeb("log", Ui("steamcmd.alreadyRunning"));
+            PushSteamCmdUpdateStatus(true, Ui("steamcmd.statusInProgress"));
+            return;
+        }
+
+        string steamCmdPath = string.IsNullOrWhiteSpace(_config.SteamCmdPath)
+            ? "C:\\steamcmd\\steamcmd.exe"
+            : _config.SteamCmdPath;
+
+        if (!File.Exists(steamCmdPath))
+        {
+            SendToWeb("log", Ui("steamcmd.notFound", steamCmdPath));
+            return;
+        }
+
+        SendToWeb("confirm_update", new
+        {
+            message = Ui("steamcmd.confirm")
+        });
+    }
+
+    private void PushSteamCmdUpdateStatus(bool active, string? label = null)
+    {
+        SendToWeb("steamcmd_update_status", new
+        {
+            active,
+            label = label ?? string.Empty
+        });
+    }
+
+    private void ForwardSteamCmdLine(string? line)
+    {
+        if (string.IsNullOrEmpty(line))
+            return;
+
+        if (!SteamCmdConsoleFilter.ShouldForwardToConsole(line))
+            return;
+
+        string? progress = SteamCmdConsoleFilter.FormatProgressLine(line);
+        SendToWeb("server_console", new { line = progress ?? line });
+    }
+
+    private async Task HandleUpdateServerConfirmedAsync()
+    {
+        if (_steamCmdUpdateInFlight)
+        {
+            SendToWeb("log", Ui("steamcmd.alreadyRunning"));
+            return;
+        }
+
+        _steamCmdUpdateInFlight = true;
+        SteamCmdConsoleFilter.ResetProgressTracking();
+        PushSteamCmdUpdateStatus(true, Ui("steamcmd.statusChecking"));
+
+        try
+        {
+            string steamCmdPath = string.IsNullOrWhiteSpace(_config.SteamCmdPath)
+                ? "C:\\steamcmd\\steamcmd.exe"
+                : _config.SteamCmdPath;
+            string serverPath = _config.ServerPath ?? string.Empty;
+
+            if (string.IsNullOrWhiteSpace(serverPath))
+            {
+                SendToWeb("server_console", new { line = Ui("steamcmd.serverPathMissing") });
+                SendToWeb("log", Ui("steamcmd.serverPathMissing"));
+                return;
+            }
+
+            SendToWeb("server_console", new { line = Ui("steamcmd.checking") });
+
+            SteamCmdUpdateCheckResult preCheck = await SteamCmdUpdateHelper.CheckUpdateNeededAsync(
+                serverPath,
+                steamCmdPath,
+                _config.SteamUpdateBranch,
+                _config.ZomboidDataPath,
+                _config.UiLanguage);
+
+            SendToWeb("server_console", new { line = preCheck.Message });
+
+            if (!preCheck.NeedsUpdate && preCheck.CheckSucceeded)
+            {
+                SendToWeb("log", preCheck.Message);
+                SendToWeb("toast_success", new { message = Ui("steamcmd.toastUpToDate") });
+                return;
+            }
+
+            PushSteamCmdUpdateStatus(true, Ui("steamcmd.statusStopping"));
+            SendToWeb("server_console", new { line = Ui("steamcmd.stoppingServer") });
+            await ExecuteStopOnlyAsync();
+
+            PushSteamCmdUpdateStatus(true, Ui("steamcmd.statusRunning"));
+            SendToWeb("server_console", new { line = Ui("steamcmd.running") });
+            SendToWeb("log", Ui("steamcmd.running"));
+
+            string updateBranch = SteamCmdUpdateHelper.GetEffectiveBranch(_config.SteamUpdateBranch);
+            string? steamDir = Path.GetDirectoryName(steamCmdPath);
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = steamCmdPath,
+                Arguments = SteamCmdUpdateHelper.BuildUpdateArguments(serverPath, updateBranch),
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+                StandardErrorEncoding = System.Text.Encoding.UTF8
+            };
+
+            if (!string.IsNullOrWhiteSpace(steamDir) && Directory.Exists(steamDir))
+                startInfo.WorkingDirectory = steamDir;
+
+            using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+
+            process.OutputDataReceived += (_, e) => ForwardSteamCmdLine(e.Data);
+            process.ErrorDataReceived += (_, e) => ForwardSteamCmdLine(e.Data);
+
+            if (!process.Start())
+            {
+                SendToWeb("server_console", new { line = Ui("steamcmd.couldNotStart") });
+                SendToWeb("log", Ui("steamcmd.couldNotStart"));
+                return;
+            }
+
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            await process.WaitForExitAsync();
+
+            int exitCode = process.ExitCode;
+            if (exitCode == 0)
+            {
+                string? updatedVersion = SteamCmdUpdateHelper.ReadInstalledGameVersion(
+                    serverPath,
+                    _config.ZomboidDataPath);
+                string versionNote = string.IsNullOrWhiteSpace(updatedVersion)
+                    ? Ui("steamcmd.finishedStartServer")
+                    : Ui("steamcmd.finishedVersion", updatedVersion);
+                SendToWeb("server_console", new { line = Ui("steamcmd.finished") + versionNote });
+                SendToWeb("log", Ui("steamcmd.finished") + versionNote);
+                SendToWeb("toast_success", new { message = Ui("steamcmd.toastSuccess") });
+            }
+            else
+            {
+                SendToWeb("server_console", new { line = Ui("steamcmd.errorCode", exitCode) });
+                SendToWeb("log", Ui("steamcmd.errorCode", exitCode));
+            }
+        }
+        catch (Exception ex)
+        {
+            SendToWeb("server_console", new { line = Ui("steamcmd.failed", ex.Message) });
+            SendToWeb("log", Ui("steamcmd.failed", ex.Message));
+        }
+        finally
+        {
+            _steamCmdUpdateInFlight = false;
+            PushSteamCmdUpdateStatus(false);
+        }
+    }
+
     private void CancelBackupInProgress()
     {
         try
         {
             _backupCts?.Cancel();
-            SendToWeb("log", "Backup cancel requested.");
+            SendToWeb("log", Ui("backup.cancelRequested"));
         }
         catch
         {
@@ -988,7 +1273,7 @@ public partial class MainForm : Form
             SendToWeb("backup_result", new
             {
                 success = false,
-                message = "A backup is already in progress."
+                message = Ui("backup.alreadyRunning")
             });
             return;
         }
@@ -1052,15 +1337,15 @@ public partial class MainForm : Form
                 HandleListBackups();
                 if (fromScheduler)
                 {
-                    SendToWeb("log", $"Scheduled backup completed: {result.Message}");
+                    SendToWeb("log", Ui("backup.completed", result.Message));
                     _backupScheduler.MarkOneTimeDone();
                 }
             }
             else if (fromScheduler)
             {
                 SendToWeb("log", result.Cancelled
-                    ? "Scheduled backup cancelled."
-                    : $"Scheduled backup failed: {result.Message}");
+                    ? Ui("backup.cancelled")
+                    : Ui("backup.failed", result.Message));
             }
         }
         catch (OperationCanceledException)
@@ -1078,10 +1363,10 @@ public partial class MainForm : Form
             {
                 success = false,
                 cancelled = true,
-                message = "Backup cancelled."
+                message = Ui("backup.cancelledMessage")
             });
             if (fromScheduler)
-                SendToWeb("log", "Scheduled backup cancelled.");
+                SendToWeb("log", Ui("backup.cancelled"));
         }
         catch (Exception ex)
         {
@@ -1101,7 +1386,7 @@ public partial class MainForm : Form
                 message = ex.Message
             });
             if (fromScheduler)
-                SendToWeb("log", $"Scheduled backup failed: {ex.Message}");
+                SendToWeb("log", Ui("backup.failed", ex.Message));
         }
         finally
         {
@@ -1143,7 +1428,7 @@ public partial class MainForm : Form
                 SendToWeb("sandbox_loaded", new
                 {
                     success = false,
-                    message = "SandboxVars.lua not found. Set Zomboid data path and load a server.ini first."
+                    message = Ui("config.sandboxNotFound")
                 });
                 return;
             }
@@ -1178,11 +1463,11 @@ public partial class MainForm : Form
                 throw new ArgumentException("Could not deserialize sandbox values.");
 
             SandboxManager.WriteSandbox(path, values);
-            SendToWeb("sandbox_saved", new { success = true, message = "SandboxVars saved." });
+            SendToWeb("sandbox_saved", new { success = true, message = Ui("config.sandboxSaved") });
         }
         catch (Exception ex)
         {
-            SendToWeb("sandbox_saved", new { success = false, message = "Error: " + ex.Message });
+            SendToWeb("sandbox_saved", new { success = false, message = Ui("config.error", ex.Message) });
         }
     }
 
@@ -1197,7 +1482,7 @@ public partial class MainForm : Form
 
                 using var dialog = new OpenFileDialog
                 {
-                    Title = "SandboxVars.lua auswählen",
+                    Title = Ui("dialog.sandboxVars"),
                     Filter = "Lua (*.lua)|*.lua|All files (*.*)|*.*",
                     CheckFileExists = true,
                     Multiselect = false
@@ -1240,7 +1525,7 @@ public partial class MainForm : Form
 
                 using var dialog = new OpenFileDialog
                 {
-                    Title = "Project Zomboid Server-Konfiguration auswählen",
+                    Title = Ui("dialog.serverIni"),
                     Filter = "INI-Dateien (*.ini)|*.ini|Alle Dateien (*.*)|*.*",
                     CheckFileExists = true,
                     Multiselect = false
@@ -1261,7 +1546,7 @@ public partial class MainForm : Form
             catch (Exception ex)
             {
                 Debug.WriteLine($"BrowseIniFile failed: {ex}");
-                SendToWeb("ini_saved", new { success = false, message = "Fehler Dialog: " + ex.Message });
+                SendToWeb("ini_saved", new { success = false, message = Ui("config.dialogError", ex.Message) });
             }
         }));
     }
@@ -1277,7 +1562,7 @@ public partial class MainForm : Form
 
                 using var dialog = new FolderBrowserDialog
                 {
-                    Description = "Project Zomboid Server-Ordner auswählen (Ordner mit StartServer64.bat)",
+                    Description = Ui("dialog.serverFolder"),
                     UseDescriptionForTitle = true,
                     ShowNewFolderButton = false
                 };
@@ -1310,7 +1595,7 @@ public partial class MainForm : Form
             catch (Exception ex)
             {
                 Debug.WriteLine($"BrowseServerFolder failed: {ex}");
-                SendToWeb("ini_saved", new { success = false, message = "Fehler Dialog: " + ex.Message });
+                SendToWeb("ini_saved", new { success = false, message = Ui("config.dialogError", ex.Message) });
             }
         }));
     }
@@ -1319,14 +1604,14 @@ public partial class MainForm : Form
     /// Finds a likely PZ dedicated server launcher .bat.
     /// Auto-fills only when exactly one likely match exists.
     /// </summary>
-    private static (string startBat, string notice) DetectStartBat(string folderPath)
+    private (string startBat, string notice) DetectStartBat(string folderPath)
     {
         if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
             return (string.Empty, string.Empty);
 
         string[] allBats = Directory.GetFiles(folderPath, "*.bat");
         if (allBats.Length == 0)
-            return (string.Empty, "No .bat files found — please select the startup file manually.");
+            return (string.Empty, Ui("config.noBatFound"));
 
         static bool IsLikely(string path)
         {
@@ -1352,16 +1637,16 @@ public partial class MainForm : Form
         if (candidates.Length == 1)
         {
             string name = Path.GetFileName(candidates[0]);
-            return (name, $"Startup file auto-detected: {name}");
+            return (name, Ui("config.startBatAuto", name));
         }
 
         if (allBats.Length == 1)
         {
             string name = Path.GetFileName(allBats[0]);
-            return (name, $"Startup file auto-detected: {name}");
+            return (name, Ui("config.startBatAuto", name));
         }
 
-        return (string.Empty, "Multiple .bat files found — please select the startup file manually.");
+        return (string.Empty, Ui("config.multipleBat"));
     }
 
     private void BrowseStartBat()
@@ -1375,7 +1660,7 @@ public partial class MainForm : Form
 
                 using var dialog = new OpenFileDialog
                 {
-                    Title = "Select server startup .bat file",
+                    Title = Ui("dialog.startBat"),
                     Filter = "Batch files (*.bat)|*.bat|All files (*.*)|*.*",
                     CheckFileExists = true,
                     Multiselect = false
@@ -1426,7 +1711,7 @@ public partial class MainForm : Form
             catch (Exception ex)
             {
                 Debug.WriteLine($"BrowseStartBat failed: {ex}");
-                SendToWeb("ini_saved", new { success = false, message = "Fehler Dialog: " + ex.Message });
+                SendToWeb("ini_saved", new { success = false, message = Ui("config.dialogError", ex.Message) });
             }
         }));
     }
@@ -1442,7 +1727,7 @@ public partial class MainForm : Form
 
                 using var dialog = new FolderBrowserDialog
                 {
-                    Description = "Zomboid Daten-Ordner auswählen (Ordner mit 'Server' Unterordner, z.B. C:\\Users\\NAME\\Zomboid)",
+                    Description = Ui("dialog.zomboidData"),
                     UseDescriptionForTitle = true,
                     ShowNewFolderButton = false,
                     InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
@@ -1457,7 +1742,7 @@ public partial class MainForm : Form
             catch (Exception ex)
             {
                 Debug.WriteLine($"BrowseZomboidDataFolder failed: {ex}");
-                SendToWeb("ini_saved", new { success = false, message = "Fehler Dialog: " + ex.Message });
+                SendToWeb("ini_saved", new { success = false, message = Ui("config.dialogError", ex.Message) });
             }
         }));
     }
@@ -1510,7 +1795,7 @@ public partial class MainForm : Form
             SendToWeb("config_profile_saved", new
             {
                 success = true,
-                message = $"Profile '{info.Name}' saved.",
+                message = Ui("config.profileSaved", info.Name),
                 profile = ToProfileDto(info)
             });
             HandleListConfigProfiles();
@@ -1562,7 +1847,7 @@ public partial class MainForm : Form
             SendToWeb("config_profile_loaded", new
             {
                 success = true,
-                message = $"Profile '{info.Name}' applied.",
+                message = Ui("config.profileApplied", info.Name),
                 profileName = info.Name,
                 iniPath,
                 sandboxPath,
@@ -1586,7 +1871,7 @@ public partial class MainForm : Form
             SendToWeb("config_profile_renamed", new
             {
                 success = true,
-                message = $"Profile renamed to '{info.Name}'.",
+                message = Ui("config.profileRenamed", info.Name),
                 profile = ToProfileDto(info)
             });
             HandleListConfigProfiles();
@@ -1603,7 +1888,7 @@ public partial class MainForm : Form
         {
             string id = ReadJsonString(data, "id");
             ConfigProfileManager.DeleteProfile(id);
-            SendToWeb("config_profile_deleted", new { success = true, message = "Profile deleted.", id });
+            SendToWeb("config_profile_deleted", new { success = true, message = Ui("config.profileDeleted"), id });
             HandleListConfigProfiles();
         }
         catch (Exception ex)
@@ -1642,11 +1927,11 @@ public partial class MainForm : Form
             if (!string.IsNullOrWhiteSpace(path))
                 _config.LastIniFilePath = path;
             RefreshHardwareStaticCache();
-            SendToWeb("ini_saved", new { success = true, message = "Konfiguration gespeichert!" });
+            SendToWeb("ini_saved", new { success = true, message = Ui("config.iniSaved") });
         }
         catch (Exception ex)
         {
-            SendToWeb("ini_saved", new { success = false, message = "Fehler: " + ex.Message });
+            SendToWeb("ini_saved", new { success = false, message = Ui("config.error", ex.Message) });
         }
     }
 
@@ -1675,7 +1960,7 @@ public partial class MainForm : Form
         string summary = hours.Count == 0
             ? "(none)"
             : string.Join(", ", hours.Select(h => $"{h:00}:00"));
-        SendToWeb("log", $"Hours saved: {summary}");
+        SendToWeb("log", Ui("hours.saved", summary));
     }
 
     private void HandleSaveRestartWarnings(JsonElement data)
@@ -1717,7 +2002,14 @@ public partial class MainForm : Form
         string escaped = text.Replace("\"", "\\\"");
         string command = $"servermsg \"{escaped}\"";
 
-        SendToWeb("log", $"RCON: {command}");
+        SendToWeb("log", Ui("rcon.prefix", command));
+        // Discord: only the 5-minute warning (10-min / 1-min stay in-game only).
+        if (minutesBefore == 5)
+        {
+            _ = NotifyDiscordEventAsync(
+                DiscordEventCatalog.PreRestartWarning,
+                new Dictionary<string, string> { ["minutes"] = "5" });
+        }
         try
         {
             string response = await _rconManager.SendCommandAsync(
@@ -1725,11 +2017,11 @@ public partial class MainForm : Form
                 _config.RconPort,
                 _config.RconPassword,
                 command);
-            SendToWeb("log", $"Pre-restart announcement ({minutesBefore} min) response: {response}");
+            SendToWeb("log", Ui("scheduler.preAnnounceResponse", minutesBefore, response));
         }
         catch (Exception ex)
         {
-            SendToWeb("log", $"Pre-restart announcement failed: {ex.Message}");
+            SendToWeb("log", Ui("scheduler.preAnnounceFailed", minutesBefore, ex.Message));
         }
     }
 
@@ -1789,6 +2081,8 @@ public partial class MainForm : Form
         _config.RconPort = GetInt("rconPort", _config.RconPort);
         _config.RconPassword = GetString("rconPassword", _config.RconPassword);
         _config.ServerPath = GetString("serverPath", _config.ServerPath);
+        _config.SteamCmdPath = GetString("steamCmdPath", _config.SteamCmdPath);
+        _config.SteamUpdateBranch = GetString("steamUpdateBranch", _config.SteamUpdateBranch);
         _config.StartBat = GetString("startBat", _config.StartBat);
         _config.ZomboidDataPath = GetString("zomboidDataPath", _config.ZomboidDataPath);
         if (data.ValueKind == JsonValueKind.Object
@@ -1818,10 +2112,11 @@ public partial class MainForm : Form
         }
 
         ConfigManager.SaveImmediately(_config);
+        _serverProcessManager.SetServerContext(_config.ServerPath, _config.StartBat);
         _statsCollector.ApplyInterval();
         RefreshHardwareStaticCache();
         SendToWeb("settings_saved", new { success = true });
-        SendToWeb("log", "Settings saved.");
+        SendToWeb("log", Ui("settings.saved"));
         HandleGetSettings();
     }
 
@@ -1943,7 +2238,7 @@ public partial class MainForm : Form
 
         (bool success, string message) = await DiscordNotifier.SendAsync(
             url,
-            "🔔 Zomboid Manager test message — webhook is working.");
+            Ui("discord.testMessage"));
         SendToWeb("discord_test_result", new { success, message });
     }
 
@@ -1960,9 +2255,177 @@ public partial class MainForm : Form
         }
         catch (Exception ex)
         {
-            SendToWeb("log", "Could not read Workshop IDs for mod update check: " + ex.Message);
+            SendToWeb("log", Ui("discord.workshopReadFailed", ex.Message));
             return new List<string>();
         }
+    }
+
+    private List<string> GetConfiguredModIds()
+    {
+        try
+        {
+            string? path = _config.LastIniFilePath;
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                return new List<string>();
+
+            Dictionary<string, string> raw = IniManager.ReadIni(path);
+            return IniManager.ParseModLists(raw).ModIds;
+        }
+        catch
+        {
+            return new List<string>();
+        }
+    }
+
+    private string FormatUpdatedModLabel(string workshopId, string? steamTitle) =>
+        ManualModMappingHelper.FormatUpdateLabel(workshopId, steamTitle, _config.ManualModMappings);
+
+    private void CancelServerStartedDiscordWatch()
+    {
+        try
+        {
+            _serverStartupWatchCts?.Cancel();
+            _serverStartupWatchCts?.Dispose();
+        }
+        catch
+        {
+            // ignore
+        }
+
+        _serverStartupWatchCts = null;
+        _serverStartupWatcher = null;
+        ClearServerBootState();
+    }
+
+    private void ClearServerBootState()
+    {
+        _awaitingServerReady = false;
+        _serverReadyConfirmed = false;
+    }
+
+    private void MarkServerBootStarting()
+    {
+        _awaitingServerReady = true;
+        _serverReadyConfirmed = false;
+    }
+
+    private void MarkServerBootReady()
+    {
+        _awaitingServerReady = false;
+        _serverReadyConfirmed = true;
+    }
+
+    /// <summary>
+    /// UI status: Online only after SERVER STARTED (or Java already up outside our boot watch).
+    /// Starting while we wait for that marker after a manager launch.
+    /// </summary>
+    private string ResolveServerUiStatus(bool javaOnline)
+    {
+        if (!javaOnline)
+            return "offline";
+        if (_serverReadyConfirmed)
+            return "online";
+        if (_awaitingServerReady)
+            return "starting";
+        if (_serverProcessManager.IsManagedProcessRunning)
+            return "starting";
+        return "online";
+    }
+
+    /// <summary>
+    /// After any StartServer call: Discord "back online" only when the PZ log marker appears
+    /// (not when the console process starts). Shared by manual start, scheduled/manual restart,
+    /// and mod-update auto-restart.
+    /// </summary>
+    private void ArmServerStartedDiscordWatch(
+        IReadOnlyDictionary<string, string>? placeholders = null)
+    {
+        CancelServerStartedDiscordWatch();
+        MarkServerBootStarting();
+        _ = HandleGetServerStatusAsync(includePlayers: false);
+
+        var cts = new CancellationTokenSource();
+        _serverStartupWatchCts = cts;
+        var watcher = new ServerStartupWatcher();
+        _serverStartupWatcher = watcher;
+
+        Dictionary<string, string>? vars = placeholders is null
+            ? null
+            : new Dictionary<string, string>(placeholders, StringComparer.OrdinalIgnoreCase);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                bool found = await watcher.WaitAsync(
+                    ResolveServerStartupLogRoots(),
+                    ServerStartupWatcher.DefaultTimeout,
+                    cts.Token,
+                    msg =>
+                    {
+                        try
+                        {
+                            SendToWeb("server_console", new { line = msg });
+                        }
+                        catch
+                        {
+                            // ignore
+                        }
+                    });
+
+                if (cts.IsCancellationRequested)
+                    return;
+
+                if (found)
+                {
+                    MarkServerBootReady();
+                    await NotifyDiscordEventAsync(DiscordEventCatalog.ServerRestarted, vars);
+                    await HandleGetServerStatusAsync(includePlayers: false);
+                    return;
+                }
+
+                _awaitingServerReady = false;
+                SendToWeb("server_console", new { line = Ui("server.startedMarkerTimeout") });
+                SendToWeb("log", Ui("server.startedMarkerTimeout"));
+                await HandleGetServerStatusAsync(includePlayers: false);
+            }
+            catch (OperationCanceledException)
+            {
+                // superseded or form closing
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    SendToWeb("log", Ui("server.startedMarkerWatchFailed", ex.Message));
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+        });
+    }
+
+    private IEnumerable<string> ResolveServerStartupLogRoots()
+    {
+        var roots = new List<string>();
+        void Add(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return;
+            string full = Path.GetFullPath(path.Trim());
+            if (!roots.Contains(full, StringComparer.OrdinalIgnoreCase))
+                roots.Add(full);
+        }
+
+        Add(_config.ServerPath);
+        Add(_config.ZomboidDataPath);
+        Add(_config.ZomboidUserPath);
+        Add(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "Zomboid"));
+        return roots;
     }
 
     private async Task NotifyDiscordEventAsync(
@@ -1988,7 +2451,8 @@ public partial class MainForm : Form
             ["date"] = DateTime.Now.ToString("yyyy-MM-dd"),
             ["datetime"] = DateTime.Now.ToString("g"),
             ["hour"] = DateTime.Now.Hour.ToString("00"),
-            ["mods"] = ""
+            ["mods"] = "",
+            ["minutes"] = ""
         };
 
         if (placeholders is not null)
@@ -2013,11 +2477,11 @@ public partial class MainForm : Form
         {
             (bool success, string message) = await DiscordNotifier.SendAsync(_config.DiscordWebhookUrl, content);
             if (!success)
-                SendToWeb("log", "Discord notify failed: " + message);
+                SendToWeb("log", Ui("discord.notifyFailed", message));
         }
         catch (Exception ex)
         {
-            SendToWeb("log", "Discord notify error: " + ex.Message);
+            SendToWeb("log", Ui("discord.notifyError", ex.Message));
         }
     }
 
@@ -2045,7 +2509,7 @@ public partial class MainForm : Form
         _ = NotifyDiscordEventAsync(
             DiscordEventCatalog.CustomHourly,
             new Dictionary<string, string> { ["hour"] = hour.ToString("00") });
-        SendToWeb("log", $"Discord custom hourly event posted ({hour:00}:00).");
+        SendToWeb("log", Ui("discord.hourlyPosted", hour));
     }
 
     private async Task HandleGetPlayerListAsync()
@@ -2061,7 +2525,7 @@ public partial class MainForm : Form
                 SendToWeb("player_list", new
                 {
                     success = false,
-                    message = string.IsNullOrWhiteSpace(response) ? "No RCON response." : response,
+                    message = string.IsNullOrWhiteSpace(response) ? Ui("rcon.noRconResponse") : response,
                     raw = response ?? "",
                     players = Array.Empty<object>()
                 });
@@ -2152,7 +2616,7 @@ public partial class MainForm : Form
 
             if (string.IsNullOrWhiteSpace(command))
             {
-                SendToWeb("player_action_result", new { success = false, message = "Invalid player action or missing fields." });
+                SendToWeb("player_action_result", new { success = false, message = Ui("player.invalidAction") });
                 return;
             }
 
@@ -2239,7 +2703,7 @@ public partial class MainForm : Form
                 || response.StartsWith("RCON error:", StringComparison.OrdinalIgnoreCase))
             {
                 string errorText = string.IsNullOrWhiteSpace(response)
-                    ? "Keine Antwort vom Server."
+                    ? Ui("rcon.noResponse")
                     : response["RCON error:".Length..].Trim();
 
                 SendToWeb("rcon_test_result", new
@@ -2253,7 +2717,7 @@ public partial class MainForm : Form
             SendToWeb("rcon_test_result", new
             {
                 success = true,
-                message = "Verbindung erfolgreich"
+                message = Ui("rcon.connectionOk")
             });
         }
         catch (Exception ex)
@@ -2278,7 +2742,7 @@ public partial class MainForm : Form
 
         if (string.IsNullOrWhiteSpace(command))
         {
-            SendToWeb("rcon_response", new { success = false, response = "No command entered." });
+            SendToWeb("rcon_response", new { success = false, response = Ui("rcon.noCommand") });
             return;
         }
 
@@ -2294,7 +2758,7 @@ public partial class MainForm : Form
         SendToWeb("rcon_response", new
         {
             success,
-            response = string.IsNullOrWhiteSpace(response) ? "(empty response)" : response
+            response = string.IsNullOrWhiteSpace(response) ? Ui("rcon.emptyResponse") : response
         });
     }
 
@@ -2307,6 +2771,8 @@ public partial class MainForm : Form
             announce10MinBeforeRestart = _config.Announce10MinBeforeRestart,
             announce5MinBeforeRestart = _config.Announce5MinBeforeRestart,
             serverPath = _config.ServerPath ?? string.Empty,
+            steamCmdPath = _config.SteamCmdPath ?? "C:\\steamcmd\\steamcmd.exe",
+            steamUpdateBranch = _config.SteamUpdateBranch ?? string.Empty,
             startBat = _config.StartBat ?? string.Empty,
             rconHost = _config.RconHost ?? string.Empty,
             rconPort = _config.RconPort,
@@ -2324,6 +2790,8 @@ public partial class MainForm : Form
             modUpdateAutoRestart = BuildModUpdateAutoRestartPayload(),
             statsIntervalMinutes = _config.StatsIntervalMinutes,
             statsRetentionDays = _config.StatsRetentionDays,
+            manualModMappings = ManualModMappingHelper.Normalize(_config.ManualModMappings)
+                .Select(ManualModMappingHelper.ToUiPayload),
             version = CurrentVersion
         };
 
@@ -2463,7 +2931,7 @@ public partial class MainForm : Form
                 SendToWeb("admin_commands_data", new
                 {
                     success = false,
-                    message = "admin_commands.json not found."
+                    message = Ui("logs.adminCommandsMissing")
                 });
                 return;
             }
@@ -2475,7 +2943,7 @@ public partial class MainForm : Form
                 SendToWeb("admin_commands_data", new
                 {
                     success = false,
-                    message = "admin_commands.json has no commands array."
+                    message = Ui("logs.adminCommandsInvalid")
                 });
                 return;
             }
@@ -2635,7 +3103,7 @@ public partial class MainForm : Form
             session = _logSession;
         if (session is null)
         {
-            SendToWeb("log_entries", new { success = false, message = "No log loaded.", rows = Array.Empty<object>(), total = 0 });
+            SendToWeb("log_entries", new { success = false, message = Ui("logs.noLogLoaded"), rows = Array.Empty<object>(), total = 0 });
             return;
         }
 
@@ -2674,7 +3142,7 @@ public partial class MainForm : Form
             session = _logSession;
         if (session is null)
         {
-            SendToWeb("log_context", new { success = false, message = "No log loaded." });
+            SendToWeb("log_context", new { success = false, message = Ui("logs.noLogLoaded") });
             return;
         }
 
@@ -2689,7 +3157,7 @@ public partial class MainForm : Form
             session = _logSession;
         if (session is null)
         {
-            SendToWeb("log_system_info", new { success = false, message = "No log loaded.", specs = Array.Empty<object>() });
+            SendToWeb("log_system_info", new { success = false, message = Ui("logs.noLogLoaded"), specs = Array.Empty<object>() });
             return;
         }
 
@@ -2703,7 +3171,7 @@ public partial class MainForm : Form
             session = _logSession;
         if (session is null)
         {
-            SendToWeb("log_mod_info", new { success = false, message = "No log loaded.", mods = Array.Empty<object>(), overrides = Array.Empty<object>() });
+            SendToWeb("log_mod_info", new { success = false, message = Ui("logs.noLogLoaded"), mods = Array.Empty<object>(), overrides = Array.Empty<object>() });
             return;
         }
 
@@ -2721,7 +3189,7 @@ public partial class MainForm : Form
 
                 using var dialog = new OpenFileDialog
                 {
-                    Title = "Open log file",
+                    Title = Ui("dialog.logFile"),
                     Filter = "Log files (*.txt;*.log)|*.txt;*.log|All files (*.*)|*.*",
                     CheckFileExists = true,
                     Multiselect = false
@@ -2752,7 +3220,7 @@ public partial class MainForm : Form
                     {
                         success = false,
                         path = full,
-                        message = "Path is outside configured log folders."
+                        message = Ui("logs.pathOutside")
                     });
                     return;
                 }
@@ -2916,20 +3384,15 @@ public partial class MainForm : Form
             if (_cachedHardwarePorts.Count == 0)
                 _cachedHardwarePorts = BuildHardwarePortsCache();
 
-            string adminsNote =
-                "Access levels are not exposed by the RCON players command. Use Player Management → Set access.";
-
             SendToWeb("hardware_stats", new
             {
                 hardware,
-                ports = _cachedHardwarePorts,
-                adminsNote,
-                admins = Array.Empty<string>()
+                ports = _cachedHardwarePorts
             });
         }
         catch (Exception ex)
         {
-            SendToWeb("log", "Hardware stats failed: " + ex.Message);
+            SendToWeb("log", Ui("stats.hardwareFailed", ex.Message));
         }
     }
 
@@ -3035,7 +3498,7 @@ public partial class MainForm : Form
         _config.BackupSchedule = _backupScheduler.Schedule;
         ConfigManager.Save(_config);
         SendToWeb("backup_schedule_status", _backupScheduler.BuildStatusPayload());
-        SendToWeb("log", "Backup schedule saved.");
+        SendToWeb("log", Ui("backup.scheduleSaved"));
     }
 
     private void HandleSaveBroadcastMessages(JsonElement data)
@@ -3093,7 +3556,7 @@ public partial class MainForm : Form
         _config.BroadcastMessages = _broadcastManager.Slots.ToList();
         ConfigManager.Save(_config);
         SendToWeb("broadcast_status", _broadcastManager.BuildStatusPayload());
-        SendToWeb("log", "Broadcast messages saved.");
+        SendToWeb("log", Ui("broadcast.saved"));
     }
 
     private async Task HandleSendBroadcastNowAsync(JsonElement data)
@@ -3122,7 +3585,7 @@ public partial class MainForm : Form
             {
                 success = false,
                 index,
-                message = "Invalid broadcast slot."
+                message = Ui("broadcast.invalidSlot")
             });
             return;
         }
@@ -3139,7 +3602,7 @@ public partial class MainForm : Form
             {
                 success = false,
                 index,
-                message = "Message text is empty."
+                message = Ui("broadcast.emptyMessage")
             });
             return;
         }
@@ -3152,13 +3615,13 @@ public partial class MainForm : Form
                 {
                     success = false,
                     index,
-                    message = "Server offline — message not sent."
+                    message = Ui("broadcast.serverOffline")
                 });
                 return;
             }
 
             string command = BroadcastRconCommand.FormatOutgoingMessage(text);
-            SendToWeb("log", $"Broadcast slot {index + 1} send-now: {command}");
+            SendToWeb("log", Ui("broadcast.logSendNowCommand", index + 1, command));
 
             string response = await _rconManager.SendCommandAsync(
                 _config.RconHost,
@@ -3175,12 +3638,12 @@ public partial class MainForm : Form
                 success,
                 index,
                 message = success
-                    ? $"Slot {index + 1} sent now."
-                    : (string.IsNullOrWhiteSpace(response) ? "RCON send failed." : response)
+                    ? Ui("broadcast.sentNow", index + 1)
+                    : (string.IsNullOrWhiteSpace(response) ? Ui("broadcast.rconFailed") : response)
             });
             SendToWeb("log", success
-                ? $"Broadcast slot {index + 1} sent now (schedule unchanged)."
-                : $"Broadcast slot {index + 1} send-now failed: {response}");
+                ? Ui("broadcast.logSentNowUnchanged", index + 1)
+                : Ui("broadcast.logSendNowFailed", index + 1, response));
         }
         catch (Exception ex)
         {
@@ -3190,7 +3653,7 @@ public partial class MainForm : Form
                 index,
                 message = ex.Message
             });
-            SendToWeb("log", $"Broadcast slot {index + 1} send-now failed: {ex.Message}");
+            SendToWeb("log", Ui("broadcast.logSendNowFailed", index + 1, ex.Message));
         }
     }
 
@@ -3206,7 +3669,7 @@ public partial class MainForm : Form
         {
             if (!IsJavaServerOnline())
             {
-                SendToWeb("log", $"Broadcast slot {index + 1} skipped (server offline).");
+                SendToWeb("log", Ui("broadcast.logSkippedOffline", index + 1));
                 return;
             }
 
@@ -3227,19 +3690,19 @@ public partial class MainForm : Form
 
             if (!success)
             {
-                SendToWeb("log", $"Broadcast slot {index + 1} failed (RCON): {response}");
+                SendToWeb("log", Ui("broadcast.logFailedRcon", index + 1, response));
                 return;
             }
 
             _broadcastManager.MarkSent(index);
             _config.BroadcastMessages = _broadcastManager.Slots.ToList();
             ConfigManager.Save(_config);
-            SendToWeb("log", $"Broadcast slot {index + 1} sent.");
+            SendToWeb("log", Ui("broadcast.logSent", index + 1));
             SendToWeb("broadcast_status", _broadcastManager.BuildStatusPayload());
         }
         catch (Exception ex)
         {
-            SendToWeb("log", $"Broadcast slot {index + 1} failed: {ex.Message}");
+            SendToWeb("log", Ui("broadcast.logFailed", index + 1, ex.Message));
         }
         finally
         {
@@ -3248,17 +3711,35 @@ public partial class MainForm : Form
         }
     }
 
-    private static bool IsJavaServerOnline()
+    private bool IsJavaServerOnline() => _serverProcessManager.IsPzServerJavaRunning();
+
+    private void MaybeWarnBrokenConfig()
     {
-        Process[] javaProcesses = Process.GetProcessesByName("java");
+        if (_configBrokenWarningShown)
+            return;
+        if (string.IsNullOrWhiteSpace(_configBrokenBackupPath) && string.IsNullOrWhiteSpace(_configLoadErrorDetail))
+            return;
+
+        _configBrokenWarningShown = true;
         try
         {
-            return javaProcesses.Length > 0;
+            string backup = string.IsNullOrWhiteSpace(_configBrokenBackupPath)
+                ? Ui("config.brokenNoBackup")
+                : _configBrokenBackupPath;
+            string detail = string.IsNullOrWhiteSpace(_configLoadErrorDetail)
+                ? ""
+                : "\n\n" + Ui("config.brokenDetail", _configLoadErrorDetail);
+            MessageBox.Show(
+                this,
+                Ui("config.brokenBody", backup) + detail,
+                Ui("config.brokenTitle"),
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            SendToWeb("log", Ui("config.brokenLog", backup));
         }
-        finally
+        catch
         {
-            foreach (Process process in javaProcesses)
-                process.Dispose();
+            // never block startup on the warning dialog
         }
     }
 
@@ -3287,10 +3768,14 @@ public partial class MainForm : Form
     /// </param>
     private async Task HandleGetServerStatusAsync(bool includePlayers = true)
     {
-        bool isOnline = IsJavaServerOnline();
+        bool javaOnline = IsJavaServerOnline();
+        string status = ResolveServerUiStatus(javaOnline);
 
         string players = "–";
-        if (includePlayers && isOnline && !string.IsNullOrWhiteSpace(_config.RconPassword))
+        int playerCount = 0;
+        int maxPlayers = TryGetConfiguredMaxPlayers();
+        // RCON only works reliably once the server has finished booting.
+        if (includePlayers && status == "online" && !string.IsNullOrWhiteSpace(_config.RconPassword))
         {
             try
             {
@@ -3304,9 +3789,16 @@ public partial class MainForm : Form
                 if (completed == rconTask)
                 {
                     string response = await rconTask;
-                    players = string.IsNullOrWhiteSpace(response) || response.StartsWith("RCON error", StringComparison.OrdinalIgnoreCase)
-                        ? "–"
-                        : response.Trim();
+                    if (string.IsNullOrWhiteSpace(response)
+                        || response.StartsWith("RCON error", StringComparison.OrdinalIgnoreCase))
+                    {
+                        players = "–";
+                    }
+                    else
+                    {
+                        players = response.Trim();
+                        playerCount = CountPlayersFromRcon(response);
+                    }
                 }
             }
             catch
@@ -3317,17 +3809,55 @@ public partial class MainForm : Form
 
         string lastRestart = _lastRestartTime.HasValue
             ? _lastRestartTime.Value.ToString("dd.MM.yyyy HH:mm:ss")
-            : "No restart in this session yet";
+            : Ui("server.noRestartYet");
 
         var payload = new
         {
-            status = isOnline ? "online" : "offline",
+            status,
             address = $"{_config.RconHost}:{_config.RconPort}",
             players,
+            playerCount,
+            maxPlayers,
             lastRestart
         };
 
         SendToWeb("server_status", payload);
+    }
+
+    private static int CountPlayersFromRcon(string response)
+    {
+        var header = System.Text.RegularExpressions.Regex.Match(
+            response,
+            @"Players connected\s*\((\d+)\)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (header.Success && int.TryParse(header.Groups[1].Value, out int fromHeader))
+            return fromHeader;
+
+        return PlayerListParser.Parse(response).Count;
+    }
+
+    private int TryGetConfiguredMaxPlayers()
+    {
+        try
+        {
+            string? path = _config.LastIniFilePath;
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                return 0;
+
+            Dictionary<string, string> ini = IniManager.ReadIni(path);
+            if (ini.TryGetValue("MaxPlayers", out string? raw)
+                && int.TryParse(raw, out int max)
+                && max > 0)
+            {
+                return max;
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+
+        return 0;
     }
 
     private void WireModUpdateRestartEvents()
@@ -3354,19 +3884,11 @@ public partial class MainForm : Form
                 void Finish()
                 {
                     PushModUpdateRestartStatus();
-                    if (success && mods.Count > 0)
+                    if (!success && !string.Equals(message, "Cancelled.", StringComparison.Ordinal))
                     {
-                        _ = NotifyDiscordEventAsync(
-                            DiscordEventCatalog.ModsUpdated,
-                            new Dictionary<string, string> { ["mods"] = string.Join(", ", mods) });
-                    }
-                    else if (!success && !string.Equals(message, "Cancelled.", StringComparison.Ordinal))
-                    {
-                        SendToWeb("log",
-                            "Mod update was detected but automatic restart failed and needs manual attention: "
-                            + message);
+                        SendToWeb("log", Ui("mods.autoRestartFailed", message));
                         _ = NotifyDiscordAsync(
-                            "⚠️ Mod update detected but automatic restart failed: " + message
+                            Ui("mods.autoRestartFailedDiscord", message)
                             + (mods.Count > 0 ? "\nMods: " + string.Join(", ", mods) : ""));
                     }
                 }
@@ -3458,20 +3980,101 @@ public partial class MainForm : Form
         ConfigManager.Save(_config);
         ApplyModUpdatePollTimer();
         SendToWeb("mod_update_auto_restart_saved", new { success = true });
-        SendToWeb("log", "Mod Update Auto-Restart settings saved.");
+        SendToWeb("log", Ui("mods.autoRestartSaved"));
         HandleGetSettings();
+    }
+
+    private void HandleSaveManualModMappings(JsonElement data)
+    {
+        var parsed = new List<ManualModMapping>();
+        if (data.ValueKind == JsonValueKind.Object
+            && data.TryGetProperty("mappings", out JsonElement listEl)
+            && listEl.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement item in listEl.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                string workshopId = "";
+                string displayName = "";
+                var modIds = new List<string>();
+
+                if (item.TryGetProperty("workshopId", out JsonElement ws)
+                    && ws.ValueKind == JsonValueKind.String)
+                {
+                    workshopId = ws.GetString() ?? "";
+                }
+
+                if (item.TryGetProperty("displayName", out JsonElement nameEl)
+                    && nameEl.ValueKind == JsonValueKind.String)
+                {
+                    displayName = nameEl.GetString() ?? "";
+                }
+
+                if (item.TryGetProperty("modIds", out JsonElement modsEl))
+                {
+                    if (modsEl.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (JsonElement modEl in modsEl.EnumerateArray())
+                        {
+                            if (modEl.ValueKind == JsonValueKind.String)
+                            {
+                                string? id = modEl.GetString();
+                                if (!string.IsNullOrWhiteSpace(id))
+                                    modIds.Add(id);
+                            }
+                        }
+                    }
+                    else if (modsEl.ValueKind == JsonValueKind.String)
+                    {
+                        string raw = modsEl.GetString() ?? "";
+                        modIds.AddRange(raw.Split(new[] { ';', ',', '\n' },
+                            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                    }
+                }
+
+                parsed.Add(new ManualModMapping
+                {
+                    WorkshopId = workshopId,
+                    DisplayName = displayName,
+                    ModIds = modIds
+                });
+            }
+        }
+
+        List<ManualModMapping> normalized = ManualModMappingHelper.Normalize(parsed);
+        _config.ManualModMappings = normalized;
+        ConfigManager.SaveImmediately(_config);
+
+        List<string> warnings = ManualModMappingHelper.WarnModIdsNotInConfiguredList(
+            normalized,
+            GetConfiguredModIds());
+
+        foreach (string warning in warnings)
+            SendToWeb("log", "⚠️ " + warning);
+
+        SendToWeb("manual_mod_mappings_saved", new
+        {
+            success = true,
+            mappings = normalized.Select(ManualModMappingHelper.ToUiPayload),
+            warnings
+        });
+        HandleGetSettings();
+        HandleGetModList();
     }
 
     private void HandleModUpdateCancelRestart()
     {
         if (_modUpdateRestartFlow.TryCancel())
         {
-            SendToWeb("log", "Mod-update pending restart cancelled.");
+            SendToWeb("log", Ui("mods.pendingRestartCancelled"));
             PushModUpdateRestartStatus();
+            _ = NotifyDiscordAsync(":orange_circle: Skipped scheduled restart");
         }
         else
         {
-            SendToWeb("log", "No cancellable mod-update restart pending.");
+            SendToWeb("log", Ui("mods.noPendingRestart"));
             PushModUpdateRestartStatus();
         }
     }
@@ -3480,7 +4083,7 @@ public partial class MainForm : Form
     {
         if (_restartInProgress || _modUpdateRestartFlow.IsActive)
         {
-            SendToWeb("log", "Restart already in progress.");
+            SendToWeb("log", Ui("restart.inProgress"));
             PushModUpdateRestartStatus();
             return;
         }
@@ -3493,7 +4096,7 @@ public partial class MainForm : Form
 
     private async Task HandleModUpdateScheduleRestartAsync(JsonElement data)
     {
-        int minutes = 5;
+        int minutes = Math.Max(1, _config.ModUpdateAutoRestart?.WarnMinutesBefore ?? 5);
         if (data.ValueKind == JsonValueKind.Object
             && data.TryGetProperty("minutes", out JsonElement m)
             && m.ValueKind == JsonValueKind.Number
@@ -3512,7 +4115,7 @@ public partial class MainForm : Form
         minutes = Math.Clamp(minutes, 1, 240);
         if (_restartInProgress || _modUpdateRestartFlow.IsActive)
         {
-            SendToWeb("log", "Cannot schedule: a restart is already in progress.");
+            SendToWeb("log", Ui("restart.cannotSchedule"));
             PushModUpdateRestartStatus();
             return;
         }
@@ -3540,18 +4143,19 @@ public partial class MainForm : Form
                     fromManual,
                     updated = false,
                     mods = Array.Empty<string>(),
-                    message = "No Workshop IDs configured (load a server.ini in Config first)."
+                    message = Ui("mods.noWorkshopIds")
                 });
                 return;
             }
 
             SendToWeb("log", fromManual
-                ? "Manual Workshop mod update check…"
-                : "Scheduled Workshop mod update check…");
+                ? Ui("mods.manualCheck")
+                : Ui("mods.scheduledCheck"));
 
             IReadOnlyList<string> updated = await ModUpdateChecker.CheckForUpdatedModsAsync(
                 ids,
-                msg => SendToWeb("log", msg));
+                msg => SendToWeb("log", msg),
+                FormatUpdatedModLabel);
 
             if (updated.Count == 0)
             {
@@ -3561,7 +4165,7 @@ public partial class MainForm : Form
                     fromManual,
                     updated = false,
                     mods = Array.Empty<string>(),
-                    message = "No mod updates detected."
+                    message = Ui("mods.noUpdates")
                 });
                 return;
             }
@@ -3573,17 +4177,16 @@ public partial class MainForm : Form
                 fromManual,
                 updated = true,
                 mods = updated.ToList(),
-                message = "Mods updated: " + joined
+                message = Ui("mods.updated", joined)
             });
-            SendToWeb("log", "Workshop updates detected: " + joined);
+            SendToWeb("log", Ui("mods.workshopUpdatesDetected", joined));
 
             bool auto = _config.ModUpdateAutoRestart?.Enabled == true;
             if (auto)
             {
                 if (_restartInProgress || _modUpdateRestartFlow.IsActive)
                 {
-                    SendToWeb("log",
-                        "Mod updates found but a restart is already in progress — Discord notify only.");
+                    SendToWeb("log", Ui("mods.restartInProgress"));
                     await NotifyDiscordEventAsync(
                         DiscordEventCatalog.ModsUpdated,
                         new Dictionary<string, string> { ["mods"] = joined });
@@ -3612,7 +4215,7 @@ public partial class MainForm : Form
                 mods = Array.Empty<string>(),
                 message = ex.Message
             });
-            SendToWeb("log", "Mod update check failed: " + ex.Message);
+            SendToWeb("log", Ui("mods.checkFailed", ex.Message));
         }
         finally
         {
@@ -3628,24 +4231,29 @@ public partial class MainForm : Form
         string? batPath = ResolveStartBatPath();
         if (batPath is null)
         {
-            SendToWeb("log", "Mod-update restart aborted: start file not found.");
+            SendToWeb("log", Ui("mods.restartAbortedNoBat"));
             SendToWeb("mod_update_check_result", new
             {
                 success = false,
-                message = "Start file not found. Configure Server folder + Start .bat in Settings."
+                message = Ui("server.startBatMissing")
             });
             return;
         }
 
         if (_restartInProgress)
         {
-            SendToWeb("log", "Mod-update restart aborted: another restart is in progress.");
+            SendToWeb("log", Ui("mods.restartAbortedInProgress"));
             return;
         }
 
         ModUpdateAutoRestartConfig settings = _config.ModUpdateAutoRestart ?? new ModUpdateAutoRestartConfig();
         _modUpdateStatusTimer.Start();
         PushModUpdateRestartStatus();
+
+        string modsJoined = string.Join(", ", updatedMods);
+        _ = NotifyDiscordEventAsync(
+            DiscordEventCatalog.ModsUpdated,
+            new Dictionary<string, string> { ["mods"] = modsJoined });
 
         await _modUpdateRestartFlow.RunAsync(
             settings,
@@ -3659,7 +4267,7 @@ public partial class MainForm : Form
                     _config.RconPort,
                     _config.RconPassword,
                     command);
-                SendToWeb("log", $"RCON: {command} → {response}");
+                SendToWeb("log", Ui("rcon.prefix", $"{command} → {response}"));
                 return response;
             },
             GetOnlinePlayerCountAsync,
@@ -3746,51 +4354,50 @@ public partial class MainForm : Form
         string password = _config.RconPassword;
 
         ct.ThrowIfCancellationRequested();
-        Mirror("RCON: save");
+        CancelServerStartedDiscordWatch();
+        MarkServerBootStarting();
+        _ = HandleGetServerStatusAsync(includePlayers: false);
+        await NotifyDiscordEventAsync(DiscordEventCatalog.ServerRestarting);
+
+        Mirror(Ui("rcon.prefix", "save"));
         string saveResponse = await _rconManager.SendCommandAsync(host, port, password, "save");
-        Mirror($"RCON response: {saveResponse}");
+        Mirror(Ui("rcon.response", saveResponse));
         if (string.IsNullOrWhiteSpace(saveResponse)
             || saveResponse.StartsWith("RCON error", StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException("RCON save failed: " + saveResponse);
         }
 
-        Mirror("Waiting 5 seconds...");
+        Mirror(Ui("restart.waiting5"));
         await Task.Delay(TimeSpan.FromSeconds(5), ct);
 
-        Mirror("RCON: quit");
+        Mirror(Ui("rcon.prefix", "quit"));
         string quitResponse = await _rconManager.SendCommandAsync(host, port, password, "quit");
-        Mirror($"RCON response: {quitResponse}");
+        Mirror(Ui("rcon.response", quitResponse));
 
-        Mirror("Waiting 15 seconds for a clean shutdown...");
+        Mirror(Ui("restart.waitingCleanShutdown"));
         await Task.Delay(TimeSpan.FromSeconds(15), CancellationToken.None);
 
-        Process[] remainingJava = Process.GetProcessesByName("java");
-        try
+        if (_serverProcessManager.IsPzServerJavaRunning())
         {
-            if (remainingJava.Length > 0)
-            {
-                Mirror($"Fallback: {remainingJava.Length} Java process(es) still running – KillServerTree.");
-                foreach (string message in _serverProcessManager.KillServerTree())
-                    Mirror(message);
-            }
-            else
-            {
-                Mirror("No Java process left – clean shutdown succeeded.");
-                foreach (string message in _serverProcessManager.CloseOrphanServerConsoles())
-                    Mirror(message);
-            }
+            Mirror(Ui("restart.javaKill"));
+            foreach (string message in _serverProcessManager.KillServerTree())
+                Mirror(message);
         }
-        finally
+        else
         {
-            foreach (Process javaProc in remainingJava)
-                javaProc.Dispose();
+            Mirror(Ui("restart.cleanShutdown"));
+            foreach (string message in _serverProcessManager.CloseOrphanServerConsoles())
+                Mirror(message);
         }
 
-        Mirror($"Starting server: {batPath}");
+        Mirror(Ui("restart.startingServer", batPath));
+        if (_modUpdateRestartFlow.Phase == ModUpdateRestartPhase.ShuttingDown)
+            _modUpdateRestartFlow.NotifyEnteringStartPhase();
         Process started = _serverProcessManager.StartServer(batPath, embedConsole: true);
-        Mirror($"Server started (PID {started.Id}).");
-        SendToWeb("server_console", new { line = $"Started embedded process PID {started.Id}" });
+        Mirror(Ui("restart.serverStarted", started.Id));
+        SendToWeb("server_console", new { line = Ui("process.embeddedPid", started.Id) });
+        ArmServerStartedDiscordWatch();
         _lastRestartTime = DateTime.Now;
         if (!string.IsNullOrWhiteSpace(restartReason))
         {
@@ -3810,14 +4417,22 @@ public partial class MainForm : Form
     {
         if (_restartInProgress || _modUpdateRestartFlow.IsActive)
         {
-            SendToWeb("log", "Restart skipped (a restart is already in progress).");
+            SendToWeb("log", Ui("restart.skippedInProgress"));
+            return;
+        }
+
+        if (!IsJavaServerOnline() && !_serverProcessManager.IsManagedProcessRunning)
+        {
+            string skip = Ui("restart.skipped");
+            SendToWeb("log", skip);
+            SendToWeb("server_console", new { line = skip });
             return;
         }
 
         string batPath = Path.Combine(_config.ServerPath ?? string.Empty, _config.StartBat ?? string.Empty);
         if (!File.Exists(batPath))
         {
-            SendToWeb("log", $"Server start aborted: start file not found: {batPath}");
+            SendToWeb("log", Ui("restart.startAborted", batPath));
             return;
         }
 
@@ -3834,16 +4449,15 @@ public partial class MainForm : Form
             int port = _config.RconPort;
             string password = _config.RconPassword;
 
-            Mirror("Restart routine started.");
-            await NotifyDiscordEventAsync(DiscordEventCatalog.RestartRoutineStarted);
-            Mirror($"Start file: {batPath}");
+            Mirror(Ui("restart.routineStarted"));
+            Mirror(Ui("restart.startFile", batPath));
 
-            Mirror("RCON: servermsg \"Server restart in 1 minute!\"");
+            Mirror(Ui("rcon.prefix", "servermsg \"Server restart in 1 minute!\""));
             string msgResponse = await _rconManager.SendCommandAsync(
                 host, port, password, "servermsg \"Server restart in 1 minute!\"");
-            Mirror($"RCON response: {msgResponse}");
+            Mirror(Ui("rcon.response", msgResponse));
 
-            Mirror("Waiting 55 seconds...");
+            Mirror(Ui("restart.waiting55"));
             await Task.Delay(TimeSpan.FromSeconds(55));
 
             await RunCleanSaveQuitStartAsync(batPath, restartReason: reason);
@@ -3853,33 +4467,29 @@ public partial class MainForm : Form
             {
                 updatedMods = await ModUpdateChecker.CheckForUpdatedModsAsync(
                     GetConfiguredWorkshopIds(),
-                    msg => Mirror(msg));
+                    msg => Mirror(msg),
+                    FormatUpdatedModLabel);
                 if (updatedMods.Count > 0)
-                    Mirror("Discord mod update note: " + string.Join(", ", updatedMods));
+                    Mirror(Ui("restart.discordModUpdateNote", string.Join(", ", updatedMods)));
             }
             catch (Exception modEx)
             {
-                Mirror("Mod update check skipped: " + modEx.Message);
+                Mirror(Ui("restart.modUpdateCheckSkipped", modEx.Message));
             }
-
-            string modsText = updatedMods.Count > 0 ? string.Join(", ", updatedMods) : "";
-            await NotifyDiscordEventAsync(
-                DiscordEventCatalog.ServerRestarted,
-                new Dictionary<string, string> { ["mods"] = modsText });
 
             if (updatedMods.Count > 0)
             {
                 await NotifyDiscordEventAsync(
                     DiscordEventCatalog.ModsUpdated,
-                    new Dictionary<string, string> { ["mods"] = modsText });
+                    new Dictionary<string, string> { ["mods"] = string.Join(", ", updatedMods) });
             }
 
-            Mirror("Restart routine finished.");
+            Mirror(Ui("restart.routineFinished"));
         }
         catch (Exception ex)
         {
-            SendToWeb("log", $"Error in restart routine: {ex.Message}");
-            SendToWeb("server_console", new { line = $"Error in restart routine: {ex.Message}" });
+            SendToWeb("log", Ui("restart.error", ex.Message));
+            SendToWeb("server_console", new { line = Ui("restart.error", ex.Message) });
         }
         finally
         {
@@ -3924,14 +4534,29 @@ public partial class MainForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        if (!_allowClose
+            && e.CloseReason == CloseReason.UserClosing
+            && (IsJavaServerOnline() || _serverProcessManager.IsManagedProcessRunning))
+        {
+            e.Cancel = true;
+            PromptCloseWhileServerRunning();
+            return;
+        }
+
         try
         {
             _hardwareTimer.Stop();
             _modUpdatePollTimer.Stop();
             _modUpdateStatusTimer.Stop();
+            _hardwareTimer.Dispose();
+            _modUpdatePollTimer.Dispose();
+            _modUpdateStatusTimer.Dispose();
             _schedulerHeartbeat.Dispose();
+            try { _modUpdateRestartFlow.TryCancel(); } catch { /* ignore */ }
+            try { CancelServerStartedDiscordWatch(); } catch { /* ignore */ }
             // Flush any coalesced config.json write before tearing down.
             ConfigManager.SaveImmediately(_config);
+            ConfigManager.DisposeDebounceTimer();
             _statsCollector.Dispose();
             _statsHistory.Dispose();
             _hardwareMonitor.Dispose();
@@ -3946,5 +4571,104 @@ public partial class MainForm : Form
         }
 
         base.OnFormClosing(e);
+    }
+
+    private void PromptCloseWhileServerRunning()
+    {
+        try
+        {
+            var stopAndClose = new TaskDialogButton(Ui("close.stopAndClose"));
+            var leaveRunning = new TaskDialogButton(Ui("close.leaveRunning"));
+            var cancel = TaskDialogButton.Cancel;
+
+            var page = new TaskDialogPage
+            {
+                Caption = Ui("close.title"),
+                Heading = Ui("close.heading"),
+                Text = Ui("close.body"),
+                Icon = TaskDialogIcon.Warning,
+                Buttons = { stopAndClose, leaveRunning, cancel },
+                DefaultButton = cancel
+            };
+
+            TaskDialogButton result = TaskDialog.ShowDialog(this, page);
+            if (result == cancel)
+                return;
+
+            if (result == stopAndClose)
+            {
+                _ = StopServerThenCloseAsync();
+                return;
+            }
+
+            // Leave server running in the background.
+            _allowClose = true;
+            BeginInvoke(Close);
+        }
+        catch (Exception ex)
+        {
+            // Fallback if TaskDialog is unavailable.
+            DialogResult fallback = MessageBox.Show(
+                this,
+                Ui("close.body") + "\n\n" + ex.Message,
+                Ui("close.title"),
+                MessageBoxButtons.YesNoCancel,
+                MessageBoxIcon.Warning);
+            if (fallback == DialogResult.Cancel)
+                return;
+            if (fallback == DialogResult.Yes)
+            {
+                _ = StopServerThenCloseAsync();
+                return;
+            }
+
+            _allowClose = true;
+            BeginInvoke(Close);
+        }
+    }
+
+    private async Task StopServerThenCloseAsync()
+    {
+        try
+        {
+            try { _modUpdateRestartFlow.TryCancel(); } catch { /* ignore */ }
+            if (!_userStopInProgress)
+            {
+                // Bypass the normal "restart in progress" guard — user explicitly chose stop & close.
+                _userStopInProgress = true;
+                try
+                {
+                    CancelServerStartedDiscordWatch();
+                    try
+                    {
+                        string response = await _rconManager.SendCommandAsync(
+                            _config.RconHost, _config.RconPort, _config.RconPassword, "quit");
+                        SendToWeb("server_console", new { line = Ui("rcon.prefix", response) });
+                        await Task.Delay(5000);
+                    }
+                    catch
+                    {
+                        // fall through to force-kill
+                    }
+
+                    foreach (string message in _serverProcessManager.KillServerTree())
+                        SendToWeb("server_console", new { line = message });
+                }
+                finally
+                {
+                    _userStopInProgress = false;
+                }
+            }
+        }
+        catch
+        {
+            // still attempt to close
+        }
+        finally
+        {
+            _allowClose = true;
+            if (IsHandleCreated && !IsDisposed)
+                BeginInvoke(Close);
+        }
     }
 }

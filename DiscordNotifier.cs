@@ -25,8 +25,8 @@ public static class DiscordNotifier
             return (false, "Message is empty.");
 
         if (!Uri.TryCreate(webhookUrl, UriKind.Absolute, out Uri? uri)
-            || (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp)
-            || !uri.Host.Contains("discord", StringComparison.OrdinalIgnoreCase))
+            || uri.Scheme != Uri.UriSchemeHttps
+            || !IsAllowedDiscordWebhookHost(uri.Host))
         {
             return (false, "Webhook URL looks invalid (expected a Discord webhook HTTPS URL).");
         }
@@ -50,5 +50,17 @@ public static class DiscordNotifier
         {
             return (false, ex.Message);
         }
+    }
+
+    private static bool IsAllowedDiscordWebhookHost(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host))
+            return false;
+
+        // Exact Discord webhook hosts only (reject e.g. notdiscord.evil.com).
+        return host.Equals("discord.com", StringComparison.OrdinalIgnoreCase)
+            || host.Equals("discordapp.com", StringComparison.OrdinalIgnoreCase)
+            || host.EndsWith(".discord.com", StringComparison.OrdinalIgnoreCase)
+            || host.EndsWith(".discordapp.com", StringComparison.OrdinalIgnoreCase);
     }
 }

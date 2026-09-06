@@ -1,5 +1,9 @@
 namespace ZomboidManager;
 
+/// <summary>
+/// Known Discord notification events, default templates, and placeholder substitution.
+/// Only the four active events are exposed in the Discord Events UI.
+/// </summary>
 public class DiscordEventSlot
 {
     public string EventKey { get; set; } = string.Empty;
@@ -17,59 +21,78 @@ public sealed class DiscordEventDefinition
     public bool DefaultEnabled { get; init; } = true;
 }
 
-/// <summary>
-/// Known Discord notification events, default templates, and placeholder substitution.
-/// </summary>
 public static class DiscordEventCatalog
 {
-    public const string RestartRoutineStarted = "restart_routine_started";
-    public const string ScheduledRestart = "scheduled_restart";
+    // Active (UI) events
+    public const string PreRestartWarning = "pre_restart_warning";
+    public const string ServerRestarting = "server_restarting";
     public const string ServerRestarted = "server_restarted";
     public const string ModsUpdated = "mods_updated";
+
+    // Legacy keys — kept so old call sites / configs compile; no longer in Definitions.
+    public const string RestartRoutineStarted = "restart_routine_started";
+    public const string ScheduledRestart = "scheduled_restart";
+    public const string ServerShuttingDown = "server_shutting_down";
     public const string CustomHourly = "custom_hourly";
+
+    private static readonly Dictionary<string, string[]> LegacyDefaultTemplates =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            [PreRestartWarning] = new[]
+            {
+                "⏰ **Game Server** – Restart in {minutes} minutes"
+            },
+            [ServerRestarting] = new[]
+            {
+                "🔴 **Game Server** – Server restarting",
+                "🔴 **Game Server** – Server is restarting",
+                "🔴 **Game Server** – Server shutting down"
+            },
+            [ServerRestarted] = new[]
+            {
+                "🟢 **Game Server** – Server is back online",
+                "▶️ Server restarted"
+            },
+            [ModsUpdated] = new[]
+            {
+                "🔔 **Game Server** – Mod Update: {mods}",
+                "🔄 Mods updated: {mods}"
+            }
+        };
 
     public static readonly DiscordEventDefinition[] Definitions =
     {
         new()
         {
-            EventKey = RestartRoutineStarted,
-            DisplayName = "Restart routine started",
-            DefaultTemplate = "🔄 Server restart routine started.",
+            EventKey = PreRestartWarning,
+            DisplayName = "Restart in 5 minutes",
+            DefaultTemplate = "⏰ **Game Server** – Restart in 5 minutes",
+            Placeholders = new[] { "time", "date", "datetime", "minutes" },
+            PlaceholderHelp = "{time}, {date}, {datetime}, {minutes} — Discord only for the 5-minute warning"
+        },
+        new()
+        {
+            EventKey = ServerRestarting,
+            DisplayName = "Server restarting",
+            DefaultTemplate = "🔴 **Game Server** – Server is restarting (takes up to 10 minutes)",
             Placeholders = new[] { "time", "date", "datetime" },
             PlaceholderHelp = "{time}, {date}, {datetime}"
         },
         new()
         {
-            EventKey = ScheduledRestart,
-            DisplayName = "Scheduled restart triggered",
-            DefaultTemplate = "🔄 Scheduled server restart triggered ({hour}:00).",
-            Placeholders = new[] { "time", "date", "datetime", "hour" },
-            PlaceholderHelp = "{time}, {date}, {datetime}, {hour}"
-        },
-        new()
-        {
             EventKey = ServerRestarted,
-            DisplayName = "Server restarted",
-            DefaultTemplate = "▶️ Server restarted",
+            DisplayName = "Server is back online",
+            DefaultTemplate = "🟢 **Game Server** – Server is back online",
             Placeholders = new[] { "time", "date", "datetime", "mods" },
-            PlaceholderHelp = "{time}, {date}, {datetime}, {mods} (updated mod titles, or empty)"
+            PlaceholderHelp = "{time}, {date}, {datetime}, {mods} — sent after *** SERVER STARTED *** in the server log"
         },
         new()
         {
             EventKey = ModsUpdated,
             DisplayName = "Mods updated",
-            DefaultTemplate = "🔄 Mods updated: {mods}",
+            DefaultTemplate = "🔔 **Game Server** – Mod Update: {mods}",
             Placeholders = new[] { "time", "date", "datetime", "mods" },
             PlaceholderHelp = "{time}, {date}, {datetime}, {mods} — only sent when Workshop mods changed"
-        },
-        new()
-        {
-            EventKey = CustomHourly,
-            DisplayName = "Custom hourly message",
-            DefaultTemplate = "📢 Scheduled announcement",
-            Placeholders = new[] { "time", "date", "datetime", "hour" },
-            PlaceholderHelp = "{time}, {date}, {datetime}, {hour} — sent at the hours selected below",
-            DefaultEnabled = false
         }
     };
 
@@ -77,6 +100,8 @@ public static class DiscordEventCatalog
         IEnumerable<DiscordEventSlot>? slots,
         string? legacyCustomMessage = null)
     {
+        _ = legacyCustomMessage;
+
         var byKey = (slots ?? Enumerable.Empty<DiscordEventSlot>())
             .Where(s => !string.IsNullOrWhiteSpace(s.EventKey))
             .GroupBy(s => s.EventKey.Trim(), StringComparer.OrdinalIgnoreCase)
@@ -87,34 +112,41 @@ public static class DiscordEventCatalog
         {
             if (byKey.TryGetValue(def.EventKey, out DiscordEventSlot? existing))
             {
-                result.Add(new DiscordEventSlot
-                {
-                    EventKey = def.EventKey,
-                    Enabled = existing.Enabled,
-                    Template = string.IsNullOrWhiteSpace(existing.Template)
-                        ? def.DefaultTemplate
-                        : existing.Template
-                });
-            }
-            else
-            {
-                string template = def.DefaultTemplate;
-                if (def.EventKey == CustomHourly
-                    && !string.IsNullOrWhiteSpace(legacyCustomMessage))
-                {
-                    template = legacyCustomMessage.Trim();
-                }
+                string template = string.IsNullOrWhiteSpace(existing.Template)
+                    ? def.DefaultTemplate
+                    : existing.Template;
+
+                if (IsLegacyDefaultTemplate(def.EventKey, template))
+                    template = def.DefaultTemplate;
 
                 result.Add(new DiscordEventSlot
                 {
                     EventKey = def.EventKey,
-                    Enabled = def.DefaultEnabled,
+                    Enabled = existing.Enabled,
                     Template = template
+                });
+            }
+            else
+            {
+                result.Add(new DiscordEventSlot
+                {
+                    EventKey = def.EventKey,
+                    Enabled = def.DefaultEnabled,
+                    Template = def.DefaultTemplate
                 });
             }
         }
 
         return result;
+    }
+
+    private static bool IsLegacyDefaultTemplate(string eventKey, string template)
+    {
+        if (!LegacyDefaultTemplates.TryGetValue(eventKey, out string[]? legacy))
+            return false;
+
+        string trimmed = (template ?? string.Empty).Trim();
+        return legacy.Any(old => string.Equals(old, trimmed, StringComparison.Ordinal));
     }
 
     public static string ApplyTemplate(string template, IReadOnlyDictionary<string, string> placeholders)

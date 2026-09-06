@@ -43,83 +43,86 @@
 
       <section class="content">
         <div id="tab-server" class="tab-content">
-          <div class="card">
-            <h3 data-i18n="server.statusTitle">Server Status</h3>
-            <div class="info-grid">
-              <div class="card info-box">
-                <div class="info-label" data-i18n="server.status">Status</div>
-                <div id="server-status-text" class="info-value">Checking...</div>
+          <div class="server-dashboard">
+            <div class="dash-row dash-row-top">
+              <div class="dash-card dash-status-card">
+                <div class="dash-card-label" data-i18n="server.statusTitle">Server Status</div>
+                <div class="dash-status-main">
+                  <span id="dash-status-dot" class="dash-status-dot offline"></span>
+                  <span id="server-status-text" class="dash-status-title">–</span>
+                </div>
+                <div id="server-status-sub" class="dash-status-sub">–</div>
+                <div class="dash-status-meta">
+                  <span id="server-address-text">–</span>
+                  <span class="dash-meta-sep">·</span>
+                  <span data-i18n="server.lastRestart">Last Restart</span>:
+                  <span id="server-lastrestart-text">–</span>
+                </div>
               </div>
-              <div class="card info-box">
-                <div class="info-label" data-i18n="server.address">Server Address</div>
-                <div id="server-address-text" class="info-value">–</div>
-              </div>
-              <div class="card info-box">
-                <div class="info-label" data-i18n="server.players">Players Online</div>
-                <div id="server-players-text" class="info-value">–</div>
-                <button class="btn secondary btn-sm" type="button" id="btn-show-players" style="margin-top:8px" data-i18n="server.showPlayers">Show Players</button>
-              </div>
-              <div class="card info-box">
-                <div class="info-label" data-i18n="server.lastRestart">Last Restart</div>
-                <div id="server-lastrestart-text" class="info-value">No restart in this session yet</div>
-              </div>
-            </div>
-          </div>
 
-          <div class="card">
-            <h3 data-i18n="server.controlTitle">Server Control</h3>
-            <p class="muted" data-i18n="server.controlHint">Here you can start, stop and restart your server.</p>
-            <div class="button-row server-control-row">
-              <button class="btn success" type="button" id="btn-server-start" onclick="requestStartServer()" data-i18n="server.start">▶️ Start</button>
-              <button class="btn danger" type="button" onclick="sendToCSharp('stop_server')" data-i18n="server.stop">🛑 Stop</button>
-              <button class="btn danger" type="button" onclick="confirmManualRestart()" data-i18n="server.restart">⚠️ Restart</button>
-              <button class="btn secondary btn-push-right" type="button" onclick="sendToCSharp('get_server_status')" data-i18n="server.refresh">🔄 Refresh</button>
+              <div class="dash-card dash-players-card">
+                <div class="dash-card-label" data-i18n="server.playersLabel">Players</div>
+                <div class="dash-players-main">
+                  <span class="dash-players-icon" aria-hidden="true">👥</span>
+                  <span id="server-players-count" class="dash-players-count">0 / –</span>
+                </div>
+                <div class="dash-progress">
+                  <div id="server-players-bar" class="dash-progress-fill"></div>
+                </div>
+                <button class="btn secondary btn-sm" type="button" id="btn-show-players" data-i18n="server.showPlayers">Show Players</button>
+                <div id="server-players-text" class="hidden" aria-hidden="true">–</div>
+              </div>
             </div>
-            <div class="console-toolbar">
-              <h4 style="margin:0" data-i18n="server.liveLog">Live console</h4>
-              <button class="btn secondary btn-sm" type="button" id="btn-clear-console" data-i18n="server.clearLog">Clear</button>
-            </div>
-            <p class="muted" style="margin:6px 0 8px" data-i18n="server.liveLogHint">Start opens a separate server console window. This panel shows manager messages.</p>
-            <div id="server-console-output" class="server-console server-console-compact"></div>
-          </div>
 
-          <div class="card">
-            <h3 data-i18n="server.hardwareTitle">Server Hardware</h3>
-            <div class="info-grid" id="hardware-static">
-              <div class="card info-box">
-                <div class="info-label" data-i18n="server.cpu">CPU</div>
-                <div id="hw-cpu-name" class="info-value">–</div>
+            <div class="dash-row dash-row-metrics">
+              <div class="dash-card dash-metric-card">
+                <div class="dash-card-label" data-i18n="server.cpuUsage">CPU Usage</div>
+                <div id="hw-cpu-pct" class="dash-metric-value">–</div>
+                <canvas id="hw-cpu-spark" class="dash-sparkline" width="280" height="48"></canvas>
+                <div id="hw-cpu-name" class="dash-metric-hint">–</div>
               </div>
-              <div class="card info-box">
-                <div class="info-label" data-i18n="server.ramTotal">Total RAM</div>
-                <div id="hw-ram-total" class="info-value">–</div>
+              <div class="dash-card dash-metric-card">
+                <div class="dash-card-label" data-i18n="server.ramUsage">Memory Usage</div>
+                <div id="hw-ram-pct" class="dash-metric-value dash-metric-value-sm">–</div>
+                <div class="dash-progress dash-progress-lg">
+                  <div id="hw-ram-bar" class="dash-progress-fill"></div>
+                </div>
+                <div id="hw-ram-total" class="dash-metric-hint">–</div>
               </div>
-              <div class="card info-box">
-                <div class="info-label" data-i18n="server.diskTotal">Disk (server drive)</div>
-                <div id="hw-disk-total" class="info-value">–</div>
-              </div>
-            </div>
-            <div class="hw-meters" style="margin-top:14px">
-              <div class="hw-meter">
-                <div class="hw-meter-label"><span data-i18n="server.cpuUsage">CPU usage</span> <strong id="hw-cpu-pct">–</strong></div>
-                <div class="hw-bar"><div id="hw-cpu-bar" class="hw-bar-fill"></div></div>
-              </div>
-              <div class="hw-meter">
-                <div class="hw-meter-label"><span data-i18n="server.ramUsage">RAM usage</span> <strong id="hw-ram-pct">–</strong></div>
-                <div class="hw-bar"><div id="hw-ram-bar" class="hw-bar-fill"></div></div>
-              </div>
-              <div class="hw-meter">
-                <div class="hw-meter-label"><span data-i18n="server.diskUsage">Disk usage</span> <strong id="hw-disk-pct">–</strong></div>
-                <div class="hw-bar"><div id="hw-disk-bar" class="hw-bar-fill"></div></div>
+              <div class="dash-card dash-metric-card">
+                <div class="dash-card-label" data-i18n="server.diskUsage">Disk Usage</div>
+                <div id="hw-disk-pct" class="dash-metric-value">–</div>
+                <div class="dash-progress dash-progress-lg">
+                  <div id="hw-disk-bar" class="dash-progress-fill"></div>
+                </div>
+                <div id="hw-disk-total" class="dash-metric-hint">–</div>
               </div>
             </div>
-          </div>
 
-          <div class="card">
-            <h3 data-i18n="server.networkTitle">Network &amp; Access</h3>
-            <div class="form-grid">
-              <div class="form-field"><span class="muted" data-i18n="server.ports">Ports</span><div id="hw-ports" class="info-value">–</div></div>
-              <div class="form-field"><span class="muted" data-i18n="server.admins">Server admins</span><div id="hw-admins" class="info-value">–</div></div>
+            <div class="dash-card dash-control-card">
+              <div class="dash-card-label" data-i18n="server.controlTitle">Server Control</div>
+              <div class="button-row server-control-row">
+                <button class="btn success" type="button" id="btn-server-start" onclick="requestStartServer()" data-i18n="server.start">▶️ Start</button>
+                <button class="btn danger" type="button" onclick="sendToCSharp('stop_server')" data-i18n="server.stop">🛑 Stop</button>
+                <button class="btn danger" type="button" onclick="confirmManualRestart()" data-i18n="server.restart">⚠️ Restart</button>
+                <button class="btn secondary btn-push-right" type="button" onclick="sendToCSharp('get_server_status')" data-i18n="server.refresh">🔄 Refresh</button>
+              </div>
+            </div>
+
+            <div class="dash-card dash-console-card">
+              <div class="console-toolbar">
+                <div class="dash-card-label" data-i18n="server.recentConsole">Recent Console</div>
+                <button class="btn secondary btn-sm" type="button" id="btn-clear-console" data-i18n="server.clearLog">Clear</button>
+              </div>
+              <div id="server-console-output" class="server-console-live"></div>
+            </div>
+
+            <div class="dash-card dash-network-card">
+              <div class="dash-card-label" data-i18n="server.networkTitle">Network &amp; Access</div>
+              <div class="form-field" style="margin:0">
+                <span class="muted" data-i18n="server.ports">Ports</span>
+                <div id="hw-ports" class="info-value">–</div>
+              </div>
             </div>
           </div>
         </div>
@@ -264,9 +267,6 @@
           </div>
           <div class="card">
             <h3 data-i18n="restarts.warningsTitle">Restart Warnings</h3>
-            <p class="muted" data-i18n="restarts.warningsHint">
-              Optional fixed chat announcements before a scheduled restart. The existing 1-minute warning is always sent.
-            </p>
             <div class="restart-warning-options">
               <label class="restart-warning-option">
                 <span class="checkbox-row">
@@ -288,46 +288,42 @@
               </label>
             </div>
           </div>
-          <div class="card">
+          <div class="card mod-restart-card">
             <h3 data-i18n="modRestart.title">Mod Update Auto-Restart</h3>
-            <p class="muted" data-i18n="modRestart.hint">
-              Automatically restart the dedicated server when a Steam Workshop mod update is detected. No in-game mod required.
+            <p class="muted mod-restart-hint" data-i18n="modRestart.hint">
+              Automatically restart the dedicated server when a Steam Workshop mod update is detected.
             </p>
-            <label class="form-field checkbox-row">
-              <input id="mod-restart-enabled" type="checkbox" />
-              <span data-i18n="modRestart.enabled">Automatically restart server when a mod update is detected</span>
-            </label>
+            <div class="mod-restart-checks">
+              <label class="form-field checkbox-row">
+                <input id="mod-restart-enabled" type="checkbox" />
+                <span data-i18n="modRestart.enabled">Automatically restart server when a mod update is detected</span>
+              </label>
+              <label class="form-field checkbox-row">
+                <input id="mod-restart-wait-empty" type="checkbox" />
+                <span data-i18n="modRestart.waitEmpty">Wait until server is empty before restarting</span>
+              </label>
+            </div>
             <label class="form-field form-field-full">
               <span data-i18n="modRestart.warningMessage">Warning message</span>
               <textarea id="mod-restart-warning" rows="3"></textarea>
               <span class="muted" data-i18n="modRestart.warningPlaceholderHint">Use {minutes} for the countdown value.</span>
             </label>
-            <div class="form-grid">
-              <label class="form-field">
-                <span data-i18n="modRestart.warnMinutes">Warn players X minutes before restart</span>
-                <input id="mod-restart-warn-minutes" type="number" min="0" max="240" value="5" />
-              </label>
-              <label class="form-field">
-                <span data-i18n="modRestart.scheduleMinutes">Schedule restart in (minutes)</span>
-                <input id="mod-restart-schedule-minutes" type="number" min="1" max="240" value="5" />
-              </label>
-            </div>
-            <label class="form-field checkbox-row">
-              <input id="mod-restart-wait-empty" type="checkbox" />
-              <span data-i18n="modRestart.waitEmpty">Wait until server is empty before restarting</span>
+            <label class="form-field">
+              <span data-i18n="modRestart.warnMinutes">Warn players X minutes before restart</span>
+              <input id="mod-restart-warn-minutes" type="number" min="0" max="240" value="5" />
             </label>
             <label class="form-field" id="mod-restart-max-wait-wrap">
               <span data-i18n="modRestart.maxWait">Maximum wait time in minutes before restarting anyway</span>
               <input id="mod-restart-max-wait" type="number" min="1" max="1440" value="60" />
             </label>
-            <div id="mod-restart-status" class="muted" style="margin-top:10px" data-i18n="modRestart.statusIdle">Idle — no mod-update restart pending.</div>
-            <div id="mod-restart-check-result" class="muted" style="margin-top:6px"></div>
-            <div class="button-row" style="margin-top:12px;flex-wrap:wrap">
+            <div id="mod-restart-status" class="muted mod-restart-status" data-i18n="modRestart.statusIdle">Idle — no mod-update restart pending.</div>
+            <div id="mod-restart-check-result" class="muted mod-restart-check-result"></div>
+            <div class="button-row mod-restart-actions">
               <button class="btn" type="button" id="mod-restart-save" data-i18n="modRestart.save">💾 Save</button>
               <button class="btn secondary" type="button" id="mod-restart-check" data-i18n="modRestart.checkNow">Check for Mod Updates Now</button>
               <button class="btn danger" type="button" id="mod-restart-now" data-i18n="modRestart.restartNow">Restart Now</button>
               <button class="btn secondary" type="button" id="mod-restart-schedule" data-i18n="modRestart.schedule">Schedule Restart In…</button>
-              <button class="btn secondary" type="button" id="mod-restart-cancel" data-i18n="modRestart.cancel">Cancel Pending Restart</button>
+              <button class="btn secondary" type="button" id="mod-restart-cancel" data-i18n="modRestart.cancel">Cancel Pending Mod Update</button>
             </div>
           </div>
           <div class="card">
@@ -342,10 +338,6 @@
             <span id="config-server-path-info">Not configured</span>
             —
             <a href="#" onclick="event.preventDefault(); switchTab('settings')" style="color:var(--accent)" data-i18n="config.changeSettings">Change settings</a>
-          </div>
-
-          <div class="info-banner" id="sandbox-hint">
-            <span data-i18n="config.sandboxHint">💡 Tip: Settings like Multi-Hit Zombies live in SandboxVars.lua. Choose SandboxVars in the dropdown below.</span>
           </div>
 
           <div class="card">
@@ -466,7 +458,7 @@
               <p data-i18n="tools.vehiclesDesc">Overview of all vehicles and spawn rates</p>
             </div>
             <div class="card tool-card" id="tool-mod-list" onclick="openModListTool()">
-              <h3>🧩 <span data-i18n="tools.modList">Mod List</span></h3>
+              <h3>🧩 <span data-i18n="tools.modList">Mod Manager</span></h3>
               <p data-i18n="tools.modListDesc">Workshop & Mod IDs from server.ini with Steam links</p>
             </div>
             <div class="card tool-card" onclick="openBackupTool()">
@@ -481,8 +473,8 @@
               <h3>👥 <span data-i18n="tools.players">Player Management</span></h3>
               <p data-i18n="tools.playersDesc">Kick, ban, whitelist, admin rights</p>
             </div>
-            <div class="card tool-card tool-card-reserved hidden" aria-hidden="true" data-tool="steamcmd" onclick="alert(t('tools.comingSoon'))">
-              <h3>⬇️ <span data-i18n="tools.steamcmd">SteamCMD Update</span></h3>
+            <div class="card tool-card" id="tool-server-update" onclick="requestServerUpdate()">
+              <h3>🔄 <span data-i18n="tools.steamcmd">SteamCMD Update</span></h3>
               <p data-i18n="tools.steamcmdDesc">Update the dedicated server via SteamCMD</p>
             </div>
             <div class="card tool-card" onclick="openDiscordTool()">
@@ -502,7 +494,7 @@
           <div id="mod-list-panel" class="card hidden">
             <div class="button-row" style="justify-content: space-between; align-items: center;">
               <div>
-                <h3 style="margin:0" data-i18n="mod.title">🧩 Mod List</h3>
+                <h3 style="margin:0" data-i18n="mod.title">🧩 Mod Manager</h3>
                 <div class="muted" id="mod-list-source"></div>
               </div>
               <div class="button-row" style="margin:0">
@@ -512,8 +504,22 @@
                 <button class="btn secondary" type="button" onclick="closeModListTool()" data-i18n="mod.close">✕ Close</button>
               </div>
             </div>
-            <div id="mod-list-stats" class="muted" style="margin: 12px 0;"></div>
-            <div id="mod-list-container" class="mod-tiles"></div>
+            <div class="settings-section mod-bundle-section" style="margin-top:16px">
+              <h4 data-i18n="modMapping.title">Bundle Mods</h4>
+              <p class="muted mod-bundle-hint" data-i18n="modMapping.hint">
+                Group several Mod IDs under one Workshop ID with a friendly display name. Unmapped mods stay one-to-one.
+              </p>
+              <div id="mod-list-mapping-rows"></div>
+              <div id="mod-list-mapping-warnings" class="muted" style="margin-top:8px"></div>
+              <div class="button-row" style="margin-top:12px;flex-wrap:wrap">
+                <button class="btn secondary" type="button" id="mod-list-mapping-add" data-i18n="modMapping.add">+ Add bundle</button>
+                <button class="btn" type="button" id="mod-list-mapping-save" data-i18n="modMapping.save">💾 Save bundles</button>
+              </div>
+            </div>
+            <div id="mod-list-stats" class="muted mod-list-stats"></div>
+            <div id="mod-list-scroll" class="mod-list-scroll">
+              <div id="mod-list-container" class="mod-tiles list-mode compact"></div>
+            </div>
           </div>
 
           <div id="backup-panel" class="card hidden">
@@ -722,33 +728,6 @@
             <h4 style="margin:16px 0 8px" data-i18n="discord.eventsTitle">Event notifications</h4>
             <p class="muted" style="margin:0 0 10px" data-i18n="discord.eventsHint">Each event can be enabled separately and uses its own message template. Placeholders are listed inside each slot.</p>
             <div id="discord-events" class="broadcast-slots"></div>
-            <p class="muted" style="margin-top:16px" data-i18n="discord.customHoursHint">Hours for the Custom hourly event (on the hour):</p>
-            <div class="hours-grid" id="discord-hours-grid">
-              <div class="hour-tile" data-hour="0">00:00</div>
-              <div class="hour-tile" data-hour="1">01:00</div>
-              <div class="hour-tile" data-hour="2">02:00</div>
-              <div class="hour-tile" data-hour="3">03:00</div>
-              <div class="hour-tile" data-hour="4">04:00</div>
-              <div class="hour-tile" data-hour="5">05:00</div>
-              <div class="hour-tile" data-hour="6">06:00</div>
-              <div class="hour-tile" data-hour="7">07:00</div>
-              <div class="hour-tile" data-hour="8">08:00</div>
-              <div class="hour-tile" data-hour="9">09:00</div>
-              <div class="hour-tile" data-hour="10">10:00</div>
-              <div class="hour-tile" data-hour="11">11:00</div>
-              <div class="hour-tile" data-hour="12">12:00</div>
-              <div class="hour-tile" data-hour="13">13:00</div>
-              <div class="hour-tile" data-hour="14">14:00</div>
-              <div class="hour-tile" data-hour="15">15:00</div>
-              <div class="hour-tile" data-hour="16">16:00</div>
-              <div class="hour-tile" data-hour="17">17:00</div>
-              <div class="hour-tile" data-hour="18">18:00</div>
-              <div class="hour-tile" data-hour="19">19:00</div>
-              <div class="hour-tile" data-hour="20">20:00</div>
-              <div class="hour-tile" data-hour="21">21:00</div>
-              <div class="hour-tile" data-hour="22">22:00</div>
-              <div class="hour-tile" data-hour="23">23:00</div>
-            </div>
             <div class="button-row" style="margin-top:12px">
               <button class="btn" type="button" id="discord-save-btn" data-i18n="discord.save">💾 Save Discord settings</button>
               <button class="btn secondary" type="button" id="discord-test-btn" data-i18n="discord.test">Send test message</button>
@@ -865,16 +844,6 @@
                 <select id="settings-ui-language">
                   <option value="de">Deutsch</option>
                   <option value="en">English</option>
-                  <option value="fr">Français</option>
-                  <option value="es">Español</option>
-                  <option value="pt-BR">Português (Brasil)</option>
-                  <option value="ru">Русский</option>
-                  <option value="pl">Polski</option>
-                  <option value="it">Italiano</option>
-                  <option value="tr">Türkçe</option>
-                  <option value="ko">한국어</option>
-                  <option value="ja">日本語</option>
-                  <option value="zh-CN">简体中文</option>
                 </select>
               </label>
             </div>
@@ -901,6 +870,18 @@
                   <button class="btn secondary" type="button" onclick="sendToCSharp('browse_start_bat')" data-i18n="settings.browse">Browse</button>
                 </div>
               </label>
+              <label class="form-field">
+                <span data-i18n="settings.steamCmdPath">SteamCMD path</span>
+                <input id="settings-steamcmd-path" type="text" data-i18n-placeholder="settings.steamCmdPlaceholder" placeholder="C:\steamcmd\steamcmd.exe" autocomplete="off" />
+              </label>
+              <label class="form-field">
+                <span data-i18n="settings.steamBranch">Server version (Steam)</span>
+                <select id="settings-steam-branch">
+                  <option value="" data-i18n="settings.steamBranchB42">B42 Stable (latest, 42.20.x) — recommended</option>
+                  <option value="legacy41" data-i18n="settings.steamBranchB41">Build 41 (legacy41)</option>
+                  <option value="42.19" data-i18n="settings.steamBranchUnstable">B42 Unstable (42.19) — legacy beta</option>
+                </select>
+              </label>
             </div>
             <div class="settings-section">
               <h4 data-i18n="settings.rconTitle">🔌 RCON connection</h4>
@@ -926,7 +907,7 @@
         <div id="tab-help" class="tab-content hidden">
           <div class="card">
             <h2 class="help-title">Zomboid Manager</h2>
-            <div id="app-version" class="help-version">Version 1.0.0</div>
+            <div id="app-version" class="help-version">Version 1.1.0</div>
             <p class="muted" data-i18n="help.desc">
               Zomboid Manager manages your Project Zomboid Dedicated Server: automated restarts, RCON control, and server tools — all in one place.
             </p>
@@ -951,18 +932,16 @@
       <select id="language-modal-select" style="width:100%; margin: 12px 0;">
         <option value="de">Deutsch</option>
         <option value="en" selected>English</option>
-        <option value="fr">Français</option>
-        <option value="es">Español</option>
-        <option value="pt-BR">Português (Brasil)</option>
-        <option value="ru">Русский</option>
-        <option value="pl">Polski</option>
-        <option value="it">Italiano</option>
-        <option value="tr">Türkçe</option>
-        <option value="ko">한국어</option>
-        <option value="ja">日本語</option>
-        <option value="zh-CN">简体中文</option>
       </select>
       <button class="btn" type="button" id="language-modal-continue" style="width:100%" data-i18n="lang.continue">Continue</button>
+    </div>
+  </div>
+
+  <div id="steamcmd-progress-modal" class="backup-progress-float hidden">
+    <div class="backup-progress-card">
+      <h2 data-i18n="steamcmd.progressTitle">Updating server…</h2>
+      <p class="muted" id="steamcmd-progress-label" data-i18n="steamcmd.progressWait">SteamCMD is downloading and validating server files…</p>
+      <div class="progress-track"><div class="progress-bar indeterminate" id="steamcmd-progress-bar" style="width:30%"></div></div>
     </div>
   </div>
 

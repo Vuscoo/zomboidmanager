@@ -118,6 +118,9 @@ public static class SandboxCatalog
 
     private static string InferInputType(string key, string value)
     {
+        if (SandboxManager.IsLuaTableLiteral(value))
+            return "lua_table";
+
         if (string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
             || string.Equals(value, "false", StringComparison.OrdinalIgnoreCase))
             return "checkbox";
