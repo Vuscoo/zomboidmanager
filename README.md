@@ -25,7 +25,7 @@
 
 ---
 
-[![Zomboid Manager Demo](docs/marketing/zmvideo-thumbnail2.png)](docs/marketing/zmvideo2.mp4)
+https://github.com/user-attachments/assets/d56770f2-6d71-4295-ab10-fcc8029d1ee5
 
 ---
 
