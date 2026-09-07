@@ -25,6 +25,10 @@
 
 ---
 
+[![Zomboid Manager Demo](docs/marketing/zmvideo-thumbnail.png)](docs/marketing/zmvideo.mp4)
+
+---
+
 ## What it does
 
 **Server Control**
@@ -38,8 +42,6 @@
 - Optional 10- and 5-minute chat warnings (1-minute warning always kept)
 - **Mod Update Auto-Restart** — when Steam Workshop mods update, optionally warn players, wait until the server is empty, then cleanly save → quit → start (warn minutes and schedule delay share one value; cancel can notify Discord)
 - Manual controls: Check for Mod Updates Now, Restart Now, Schedule Restart In…, Cancel Pending Restart
-
-![Mod Update Auto-Restart feature](docs/images/mod-update-auto-restart.png)
 
 **Config Management**
 - Edit `server.ini` / `servertest.ini` with categories and search
@@ -55,17 +57,8 @@
 
 **Tools**
 - Hub for backups, broadcasts, players, Discord, logs, mods, SteamCMD server update, and admin commands
-
-![Tools tab overview](docs/images/tools.png)
-
 - **Backup Manager** — dated zip of server configs + Multiplayer world; Backup Now or weekly / one-time schedules; progress in a corner panel (cancel supported)
-
-![Backup Manager with automatic scheduling](docs/images/backup-manager.png)
-
 - **Log Analyzer** — readable table from the server `logs` folder and `Zomboid\Logs`; filter by level / category, search, ERROR/WARN tinting, row context, System Info / Mod Info panels
-
-![Log Analyzer tool](docs/images/log-analyzer.png)
-
 - **Server update (SteamCMD)** — check/update the dedicated server to the configured Steam branch (B42 Stable by default)
 - **Server Broadcaster** — up to 5 scheduled chat messages (one-time or recurring) plus Send Now
 - **Admin Command Reference** — searchable Build 42 admin commands (English / German keywords)
@@ -137,8 +130,6 @@ Real `config.json` with passwords / webhooks must never be committed.
 See **[CHANGELOG.md](CHANGELOG.md)** for the full version history (v1.1.0 and earlier).
 
 ---
-
-![Help & Info tab](docs/images/help.png)
 
 ## Support
 
