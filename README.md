@@ -25,7 +25,7 @@
 
 ---
 
-[![Zomboid Manager Demo](docs/marketing/zmvideo-thumbnail.png)](docs/marketing/zmvideo.mp4)
+[![Zomboid Manager Demo](docs/marketing/zmvideo-thumbnail2.png)](docs/marketing/zmvideo2.mp4)
 
 ---
 
